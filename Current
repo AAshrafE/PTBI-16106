@@ -1,0 +1,1490 @@
+CREATE   PROCEDURE [etl].[P_FCT_CPS_INDICATORS] 
+	@SK_AUD bigint = -1, @RELOAD_DATE date = null
+AS
+BEGIN
+
+--DECLARE @SK_AUD AS int, @RELOAD_DATE date = '20240322'
+--SET @SK_AUD = -0  
+ 
+/*
+CPS = Customer Profiling Score
+- classifies each customer twice : 
+	- 'POSTMAYMENT' - customers have the option to pay with Cash on Delivery. by default each customer has this enabled, unless he/she is blacklisted. there are several criteria by which a customer can be blacklisted.
+	- 'GLOBAL POSTPAYMENT PRIVILEGE' -concerns orders with global products. by default NOT enabled. 
+*/
+ 
+--select distinct top 9 sk_aud_insert from FCT_CPS_INDICATORS order by 1 desc
+ 
+ 
+--SET @SK_AUD = CASE WHEN @SK_AUD<>-1 THEN @SK_AUD ELSE FORMAT(GETDATE(),'yyyyMMdd') END
+ 
+DECLARE @SK_AUD_increment AS INT
+SET @SK_AUD_increment = (SELECT ISNULL(MAX(SK_AUD_INSERT),0) FROM FCT_CPS_INDICATORS f INNER JOIN [$(JUMIA_BI_CONFIG)]..AUD_EXECUTION a on a.SK_AUD = f.SK_AUD_insert )  
+ 
+DECLARE @minDate BIGINT 
+SET @minDate = CASE WHEN @RELOAD_DATE IS NULL THEN (SELECT ISNULL(CAST(CONVERT(VARCHAR(8),dateadd(day,-1,dat_run_date),112) AS INT),@SK_AUD_increment-1) FROM [$(JUMIA_BI_CONFIG)]..AUD_EXECUTION WHERE SK_AUD=@SK_AUD_increment)
+	ELSE CAST(CONVERT(VARCHAR(8),@RELOAD_DATE,112) AS INT) END
+
+DECLARE @minJPSegmentDate AS INT
+SET @minJPSegmentDate = CASE WHEN (SELECT COUNT(DD_DIMENSION) FROM FCT_CPS_INDICATORS WHERE DD_DIMENSION = 'dim_12') > 0
+						THEN (SELECT CAST(CONVERT(VARCHAR(8),DATEADD(DAY,-5,GETDATE()),112) AS INT))
+						ELSE (SELECT CAST(CONVERT(VARCHAR(8),DATEADD(YEAR,-4,GETDATE()),112) AS INT)) -- if we never reprocessed jpaysegment, takes 4 year of data to reprocess
+						END
+
+
+ 
+DROP TABLE IF EXISTS #currently_blacklisted;  
+DROP TABLE IF EXISTS #whitelist;  
+DROP TABLE IF EXISTS #last3m_blacklist_customers;  
+DROP TABLE IF EXISTS #currently_blacklisted_phonenumbers;  
+DROP TABLE IF EXISTS #blacklisted_phonenumber_customeraccounts;  
+DROP TABLE IF EXISTS #final_insert;  
+DROP TABLE IF EXISTS #global_customers;  
+--DROP TABLE IF EXISTS #rma_abuse;  
+DROP TABLE IF EXISTS #BLACK_LISTED_CUSTOMERS;
+DROP TABLE IF EXISTS #TBT_JPAY_CUSTOMERS_TO_CONSIDER;
+DROP TABLE IF EXISTS #cancellation_customers;
+DROP TABLE IF EXISTS #INC_CUSTOMER;
+DROP TABLE IF EXISTS #cancellation_customers_not_jforce;
+DROP TABLE IF EXISTS #cancellation_customers_jforce;
+DROP TABLE IF EXISTS #TMP_CPS_OVERRIDE;
+DROP TABLE IF EXISTS #TMP_LAST_WHITELIST;
+DROP TABLE IF EXISTS #sk_customer_email_blacklisted;
+DROP TABLE IF EXISTS #customer_email_original_blacklisted;
+DROP TABLE IF EXISTS #blacklisted_email_customeraccounts;
+
+ 
+DECLARE @Success_Rate_threshhold FLOAT
+DECLARE @Success_Rate_threshhold2 FLOAT
+DECLARE @Nr_shipped_orders_threshhold INT
+DECLARE @Nr_shipped_orders_threshhold2 INT
+DECLARE @Country VARCHAR(2) = dbo.F_get_country_code()
+DECLARE @last3m_Success_Rate_threshhold FLOAT
+DECLARE @last3m_Nr_shipped_orders_threshhold INT
+DECLARE @Last3m_start INT
+DECLARE @Last3m_end INT
+ 
+DECLARE @LAST_3M_WHITELIST_START AS INT = CASE WHEN @Country = 'GH' THEN convert(int, convert(varchar(10), cast(DATEADD(month, -3, getdate()) as date), 112)) 
+												ELSE 19000101 END;
+ 
+DECLARE @WHITELIST_SUCCESS_RATE AS FLOAT = CASE WHEN @Country = 'GH' THEN 0.31 --PTBI-3503
+											WHEN @Country = 'UG' THEN 0.20
+											ELSE 0.6 END
+ 
+SET @Success_Rate_threshhold = CASE WHEN @Country in ('CI') THEN 0.66
+									WHEN @Country in ('DZ') THEN 0.50
+									WHEN @Country in ('EG') THEN 0.66
+									WHEN @Country in ('GH') THEN 0.66 -- Change to 30% PTBI-3503
+									WHEN @Country in ('KE') THEN 0.66
+									WHEN @Country in ('MA') THEN 0.66
+									WHEN @Country in ('NG') THEN 0.66
+									WHEN @Country in ('SN') THEN 0.50
+									WHEN @Country in ('TN') THEN 0.50
+									When @Country in ('UG') THEN 0.50
+								ELSE 0.60 END;
+
+SET @Success_Rate_threshhold2 = CASE WHEN @Country in ('DZ') THEN 0.2 -- PTBI-8230 - New logic for DZ
+								END;
+
+/* For @Nr_shipped_orders_threshhold if Orders >= X (when for example X = 3) then the value of @Nr_shipped_orders_threshhold should be X-1 (which for the example is 2)*/
+SET @Nr_shipped_orders_threshhold = CASE WHEN @Country in ('DZ') THEN 9 -- PTBI-8230 Orders >= 10 
+										WHEN @Country in ('EG') THEN 2
+										WHEN @Country in ('GH') THEN 2 --PTBI-4898 Orders >= 3
+										WHEN @Country in ('KE') THEN 2
+										WHEN @Country in ('MA') THEN 2
+										WHEN @Country in ('NG') THEN 3
+										WHEN @Country in ('SN') THEN 2 --PTBI-4898 Orders >= 3
+										WHEN @Country in ('TN') THEN 3  --PTBI-4898 Orders >= 4
+										When @Country in ('UG') THEN 2 --PTBI-4898 Orders >= 3
+									ELSE 3 END;
+
+SET @Nr_shipped_orders_threshhold2 = CASE	WHEN @Country in ('DZ') THEN 4 -- PTBI-8230 Orders >= 5
+											END;
+									
+DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_1_order FLOAT = .9;
+DECLARE @GlobalPostpayment_Success_Rate_threshhold_3_orders FLOAT = .8;
+ 
+
+DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_50_order FLOAT = .99;	--PTBI-3873 Especially for Emerging countires until we create a table to maintain variables
+DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_100_order FLOAT = .98;	--PTBI-3873 Especially for Emerging countires until we create a table to maintain variables
+
+DECLARE @CPS_CANCELLATION_RATE FLOAT        = (SELECT CONVERT(FLOAT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_RATE');
+DECLARE @CPS_CANCELLATION_ITEMS  INT        = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ITEMS');
+DECLARE @CPS_CANCELLATION_ORDERS        INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ORDERS');
+DECLARE @CPS_CANCELLATION_RATE_JFORCE FLOAT = (SELECT CONVERT(FLOAT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_RATE_JFORCE');
+DECLARE @CPS_CANCELLATION_ORDERS_JFORCE INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ORDERS_JFORCE');
+DECLARE @CPS_CANCELLATION_ITEMS_JFORCE  INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ITEMS_JFORCE');
+
+ 
+SET @Last3m_start = CONVERT(INT, CONVERT(VARCHAR(10), CAST(DATEADD(month, -3, getdate()) AS DATE), 112)) 
+SET @Last3m_end =  CONVERT(INT, (CONVERT(VARCHAR(10), CAST(GETDATE() AS DATE), 112))) 
+SET @last3m_Success_Rate_threshhold = CASE WHEN @Country in ('CI') THEN 0.50 -- PTBI-4894
+										WHEN @Country in ('DZ') THEN 0.50 -- PTBI-4898
+										WHEN @Country in ('GH') THEN 0.50 -- PTBI-4898
+										WHEN @Country in ('MA') THEN 0.55
+										WHEN @Country in ('SN') THEN 0.50 -- PTBI-4898
+										WHEN @Country in ('TN') THEN 0.50 -- PTBI-4898
+										When @Country in ('UG') THEN 0.50 -- PTBI-4898
+									ELSE 0.50 END;
+									
+SET @last3m_Nr_shipped_orders_threshhold = CASE	WHEN @Country in ('DZ') THEN 10 -- PTBI-8230 Orders > 10
+												ELSE 3 END;	
+  
+ 
+--Changes required by PTBI-2815
+DECLARE @LAST_2M_START int = CONVERT(INT, CONVERT(VARCHAR(10), CAST(DATEADD(month, -2, getdate()) AS DATE), 112)) 
+DECLARE @LAST_1M_START int = CONVERT(INT, CONVERT(VARCHAR(10), CAST(DATEADD(month, -1, getdate()) AS DATE), 112)) 
+DECLARE @CURRENT_DATE int = CONVERT(INT, (CONVERT(VARCHAR(10), CAST(GETDATE() AS DATE), 112)))
+DECLARE @WHITELIST_7D_SUCCESS_RATE FLOAT = 0.6
+
+-- Getting all the overrided customers..
+SELECT 
+	X.SK_CUSTOMER, 
+	X.MTR_VALUE, 
+	X.DIMENSION,
+	X.SK_DATE
+INTO #TMP_CPS_OVERRIDE
+FROM (
+	SELECT 
+		DC.SK_CUSTOMER,  
+		COD_OVERRIDE_VALUE AS MTR_VALUE, 
+		DO.DSC_CPS_DIMENSION AS DIMENSION,
+		F.SK_DATE,
+		ROW_NUMBER()OVER(PARTITION BY DC.SK_CUSTOMER, DC.COD_CAS ORDER BY SK_DATE DESC) ORDEM
+	FROM FCT_CPS_OVERRIDE F (NOLOCK)
+	JOIN DIM_CUSTOMER DC (NOLOCK) ON F.SK_CUSTOMER = DC.SK_CUSTOMER
+	JOIN V_D98_DIM_CPS_OVERRIDE DO (NOLOCK) ON DO.SK_CPS_DIMENSION = F.SK_CPS_OVERRIDE
+	WHERE F.FLG_IS_DELETED = 0
+	  AND DC.COD_CAS IS NOT NULL
+	  AND DO.DSC_CPS_DIMENSION IN ('GLOBAL_POSTPAYMENT_PRIVILEGE','POSTPAYMENT','dim_12')
+) X
+WHERE X.ORDEM = 1
+;
+
+SELECT SK_CUSTOMER,
+       MAX(SK_DATE) LAST_WL_DATE
+  INTO #TMP_LAST_WHITELIST
+  FROM FCT_CPS_INDICATORS
+ WHERE FLG_WHITELIST = 1 
+   AND DD_DIMENSION = 'POSTPAYMENT' 
+GROUP BY SK_CUSTOMER;
+
+ 
+CREATE TABLE #last3m_blacklist_customers (SK_CUSTOMER BIGINT)
+  
+INSERT INTO #last3m_blacklist_customers
+SELECT 
+	sk_customer
+FROM (
+SELECT s.sk_customer AS sk_customer,
+		COUNT(DISTINCT (CASE WHEN dsc_bi_status = 'delivered_final' THEN s.sk_sales_order
+						ELSE NULL END)) AS nr_delivered_final_orders,
+		SUM(CASE WHEN sk_delivered_date <> -1 THEN 1 ELSE 0 END) AS nr_delivered_items,
+
+		COUNT(DISTINCT 
+			CASE WHEN sk_shipped_date <> -1 
+					AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+					AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+						 ( r.DSC_REASON_NAME like 'CA02%'
+						OR r.DSC_REASON_NAME like 'CA03%'
+						OR r.DSC_REASON_NAME like 'CA04%'
+						OR r.DSC_REASON_NAME like 'CA06%'
+						OR r.DSC_REASON_NAME like 'CA09%'
+						OR r.DSC_REASON_NAME like 'CA11%'
+						OR r.DSC_REASON_NAME like 'CA12%'
+						OR r.DSC_REASON_NAME like 'CA14%'
+						OR r.DSC_REASON_NAME like 'CA15%'
+						OR r.DSC_REASON_NAME like 'CA16%'
+						OR r.DSC_REASON_NAME like 'CA18%'
+						OR r.DSC_REASON_NAME like 'CA43%'
+						OR r.DSC_REASON_NAME like 'CA47%'
+						OR r.DSC_REASON_NAME like 'CA54%'
+						OR r.DSC_REASON_NAME like 'CA55%'
+						OR r.DSC_REASON_NAME like 'CA57%'
+						OR r.DSC_REASON_NAME like 'CA58%'
+						OR r.DSC_REASON_NAME like 'CA59%'
+						OR r.DSC_REASON_NAME like 'CA64%'
+						OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+													,'Customer not able to pay on delivery'
+													,'Recipient reachable but not available'
+													,'Customer is a suspect of fraud/abuse'
+													,'Recipient provided invalid address/phone number'
+													,'This is a duplicate order'
+													,'Recipient needs consolidated delivery'
+													,'Shipping Fee is High'
+													,'Found a better offer outside Jumia'
+													,'Found a better offer in Jumia'
+													,'Not interested in order anymore'
+													,'Recipient requested delivery out of SLA or did not collect within SLA'
+													,'Change delivery address/method'
+													,'Recipient wanted to open package'
+													,'Could not provide OTP'
+													,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+													,'I was testing Jumia'
+													,'Want to change voucher code'
+													)
+						  )
+						 )
+				THEN s.sk_sales_order
+				ELSE NULL 
+				END 
+			) AS nr_shipped_orders,
+
+		COUNT(DISTINCT 
+			CASE WHEN sk_shipped_date <> -1 
+					AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+					AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+						 ( r.DSC_REASON_NAME like 'CA02%'
+						OR r.DSC_REASON_NAME like 'CA03%'
+						OR r.DSC_REASON_NAME like 'CA04%'
+						OR r.DSC_REASON_NAME like 'CA06%'
+						OR r.DSC_REASON_NAME like 'CA09%'
+						OR r.DSC_REASON_NAME like 'CA11%'
+						OR r.DSC_REASON_NAME like 'CA12%'
+						OR r.DSC_REASON_NAME like 'CA14%'
+						OR r.DSC_REASON_NAME like 'CA15%'
+						OR r.DSC_REASON_NAME like 'CA16%'
+						OR r.DSC_REASON_NAME like 'CA18%'
+						OR r.DSC_REASON_NAME like 'CA43%'
+						OR r.DSC_REASON_NAME like 'CA47%'
+						OR r.DSC_REASON_NAME like 'CA54%'
+						OR r.DSC_REASON_NAME like 'CA55%'
+						OR r.DSC_REASON_NAME like 'CA57%'
+						OR r.DSC_REASON_NAME like 'CA58%'
+						OR r.DSC_REASON_NAME like 'CA59%'
+						OR r.DSC_REASON_NAME like 'CA64%'
+						OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+													,'Customer not able to pay on delivery'
+													,'Recipient reachable but not available'
+													,'Customer is a suspect of fraud/abuse'
+													,'Recipient provided invalid address/phone number'
+													,'This is a duplicate order'
+													,'Recipient needs consolidated delivery'
+													,'Shipping Fee is High'
+													,'Found a better offer outside Jumia'
+													,'Found a better offer in Jumia'
+													,'Not interested in order anymore'
+													,'Recipient requested delivery out of SLA or did not collect within SLA'
+													,'Change delivery address/method'
+													,'Recipient wanted to open package'
+													,'Could not provide OTP'
+													,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+													,'I was testing Jumia'
+													,'Want to change voucher code'
+													)
+						  )
+						 )
+				THEN s.sk_sales_order_item
+				ELSE NULL 
+				END 
+			) AS nr_shipped_items
+
+FROM [dbo].[FCT_SALES_ORDER_ITEM_MARKETING] s WITH (NOLOCK)
+LEFT JOIN dim_customer dcs ON s.[SK_CUSTOMER] = dcs.[SK_CUSTOMER]
+INNER JOIN dim_bi_status bi_sts ON s.sk_bi_status = bi_sts.sk_bi_status AND dcs.cod_system = 'BOB'
+LEFT JOIN DIM_REASON r ON r.SK_REASON = S.SK_REASON
+LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = s.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
+LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = s.SK_CUSTOMER
+WHERE s.SK_DATE BETWEEN (SELECT MAX(V_MAX) FROM (VALUES (TMP.SK_DATE), (TWL.LAST_WL_DATE), (@Last3m_start)) AS value(V_MAX))
+                    AND @Last3m_end
+GROUP BY s.SK_CUSTOMER
+) A
+WHERE nr_shipped_orders > @last3m_Nr_shipped_orders_threshhold AND 
+ISNULL(ISNULL(TRY_CONVERT(FLOAT, nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, nr_shipped_items), 0), 0), 0) < @last3m_Success_Rate_threshhold 
+ 
+ 
+/* FLG_RMA_abuse - customers will be blacklisted if they had abused RMA. and then they will not be eligible for whitelisting */
+--CREATE TABLE #rma_abuse (sk_customer BIGINT, didnt_return_in_time BIT)
+-- PTBI-5485: DEPRECATION OF RMA_ABUSE (WE'LL KEEP IT THIS WAYS BECAUSE IT WILL RETURN WITH A DIFFERENT FORMAT)
+--insert into #rma_abuse
+--select sk_customer, didnt_return_in_time from v_rma_classification_for_cps where classification='OFF'
+ 
+ 
+/*****************************************  
+This query identifies customers to be blacklisted for PostPayment
+   - customers with more than @Nr_shipped_orders_threshhold shipped orders are considered. when less than half (OR @Success_Rate_threshhold) of items of their orders are delivered, they are blacklisted.
+   - when they get delivered successfully two orders after being blacklisted, they are taken off the blacklist  
+*****************************************/ 
+ 
+/* currently blacklisted customers */ 
+CREATE TABLE #currently_blacklisted (sk_customer BIGINT)
+INSERT INTO #currently_blacklisted
+SELECT CPSI.SK_CUSTOMER
+FROM FCT_CPS_INDICATORS CPSI WITH (NOLOCK)
+INNER JOIN (
+		SELECT SK_CUSTOMER, MAX(SK_DATE)SK_DATE, DD_DIMENSION
+		FROM FCT_CPS_INDICATORS WITH (NOLOCK)
+		WHERE DD_DIMENSION = 'POSTPAYMENT' 
+		GROUP BY SK_CUSTOMER, DD_DIMENSION
+)    LAST_DATE ON CPSI.SK_CUSTOMER=LAST_DATE.SK_CUSTOMER
+					AND CPSI.SK_DATE=LAST_DATE.SK_DATE
+					AND CPSI.DD_DIMENSION=LAST_DATE.DD_DIMENSION
+WHERE MTR_VALUE='OFF'
+--UNION 
+--SELECT sk_customer FROM #rma_abuse
+ 
+   
+ 
+/* Whitelist. check the last two orders of customer. if they get to status Delivered /Delivered Final, the customer can be taken of the Blacklist.   
+This will also effectively whitelist customers who return majority of items from their orders, as long as both items are delivered.   */ 
+ 
+CREATE TABLE #whitelist (sk_customer BIGINT, success_rate FLOAT, nr_delivered_final_orders INT)
+  
+INSERT INTO #whitelist
+SELECT sub1.sk_customer,
+    ISNULL(ISNULL(TRY_CONVERT(FLOAT, sum(nr_delivered_items)), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, SUM(nr_items)), 0), 0), 0) AS success_rate, 
+	SUM (CASE
+            WHEN dsc_bi_status in ('delivered_final','delivered','returned','returned_final') THEN 1																
+            ELSE 0
+        END) AS nr_delivered_orders
+FROM
+(SELECT dcs.sk_customer,
+        sk_sales_order,
+        sts.dsc_bi_status,
+		SK_PENDING_CS_DATE,
+		SK_CONFIRMED_DATE,
+        sk_shipped_date,
+        sk_delivered_date,
+        nr_delivered_items,
+        nr_items,
+        ROW_NUMBER() OVER (PARTITION BY dcs.sk_customer
+                            ORDER BY SK_PENDING_CS_DATE DESC, CASE WHEN SK_CONFIRMED_DATE = '30000101' THEN -1 ELSE SK_CONFIRMED_DATE END DESC, s.sk_shipped_date DESC,sk_delivered_date DESC,sk_sales_order DESC) AS order_desc
+FROM
+    (SELECT sk_customer,
+            sk_sales_order,
+            MAX(RNK.COD_STATUS_RANKING) MAX_COD_STATUS_RANKING,
+			min(SK_PENDING_CS_DATE) SK_PENDING_CS_DATE,
+			min(SK_CONFIRMED_DATE) SK_CONFIRMED_DATE,
+            min(sk_shipped_date) sk_shipped_date,
+            min(sk_delivered_date) sk_delivered_date,
+            Sum(CASE
+                                    WHEN sk_delivered_date <> -1 THEN 1
+                                    ELSE 0
+                                END) AS nr_delivered_items,
+            Count(DISTINCT CASE
+                                                WHEN SK_CONFIRMED_DATE <> -1 THEN ord.sk_sales_order_item
+                                                ELSE NULL
+                                            END) AS nr_items
+    FROM [dbo].[FCT_SALES_ORDER_ITEM_MARKETING] ORD
+    LEFT JOIN DIM_BI_STATUS_RANKING RNK ON ORD.SK_STATUS_RANKING=RNK.SK_STATUS_RANKING
+    INNER JOIN dim_bi_status bi_sts ON ord.sk_bi_status = bi_sts.sk_bi_status
+    LEFT JOIN DIM_REASON r ON r.SK_REASON = ORD.SK_REASON
+    WHERE SK_CONFIRMED_DATE > 0
+        AND ORD.SK_DATE BETWEEN @LAST_3M_WHITELIST_START AND @CURRENT_DATE 
+		AND DSC_BI_STATUS NOT IN ('shipped', 'stock_out', 'invalid', 'fraud','pending_finance','pending_cs', 'confirmed' )
+		AND (DSC_BI_STATUS NOT IN ('cancelled', 'rejected') 
+												OR (
+												r.DSC_REASON_NAME like 'CA02%'
+												OR r.DSC_REASON_NAME like 'CA03%'
+												OR r.DSC_REASON_NAME like 'CA05%'
+												OR r.DSC_REASON_NAME like 'CA06%'
+												OR r.DSC_REASON_NAME like 'CA08%'
+												OR r.DSC_REASON_NAME like 'CA09%'
+												OR r.DSC_REASON_NAME like 'CA10%'
+												OR r.DSC_REASON_NAME like 'CA11%'
+												OR r.DSC_REASON_NAME like 'CA14%'
+												OR r.DSC_REASON_NAME like 'CA15%'
+												OR r.DSC_REASON_NAME like 'CA16%'
+												OR r.DSC_REASON_NAME like 'CA18%'
+												OR r.DSC_REASON_NAME like 'CA44%'
+												OR r.DSC_REASON_NAME like 'CA47%'
+												OR r.DSC_REASON_NAME like 'CA57%'
+												OR r.DSC_REASON_NAME like 'CA58%'
+												OR r.DSC_REASON_NAME like 'CA59%'
+												OR r.DSC_REASON_NAME like 'CA04%'
+												OR r.DSC_REASON_NAME like 'CA12%'
+												OR r.DSC_REASON_NAME like 'CA43%'
+												OR r.DSC_REASON_NAME like 'CA54%'
+												OR r.DSC_REASON_NAME like 'CA55%'
+												OR r.DSC_REASON_NAME like 'CA64%'
+												OR r.DSC_REASON_NAME IN    (
+																			'Changed mind'
+																			,'Changed mode of payment'
+																			,'Customer not reachable'
+																			,'Decided for alternative product'
+																			,'Duplicate order'
+																			,'Duplicated order'
+																			,'Forgot to input voucher'
+																			,'Found a better offer'
+																			,'Found a better offer outside Jumia'
+																			,'Found cheaper alternative'
+																			,'Fraud suspect'
+																			,'Not interested anymore'
+																			,'Other1'
+																			,'Shipping fees too high'
+																			,'Test order'
+																			,'Voucher issue'
+																			,'Wrong address'
+																			,'Wrong delivery address/method'
+																			,'Wrong payment method'
+																			,'Wrong voucher code'
+																			, 'Recipient not reachable'
+																			,'Customer not able to pay on delivery'
+																			,'Recipient reachable but not available'
+																			,'Customer is a suspect of fraud/abuse'
+																			,'Recipient provided invalid address/phone number'
+																			,'This is a duplicate order'
+																			,'Recipient needs consolidated delivery'
+																			,'Shipping Fee is High'
+																			,'Found a better offer in Jumia'
+																			,'Not interested in order anymore'
+																			,'Recipient requested delivery out of SLA or did not collect within SLA'
+																			,'Change delivery address/method'
+																			,'Recipient wanted to open package'
+																			,'Could not provide OTP'
+																			,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+																			,'I was testing Jumia'
+																			,'Want to change voucher code'
+                                             								)
+                                            )
+            )
+    GROUP BY sk_customer,
+            sk_sales_order) s
+
+LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = s.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'OFF'
+LEFT JOIN dim_customer dcs ON s.[SK_CUSTOMER] = dcs.[SK_CUSTOMER]
+AND dcs.cod_system = 'BOB'
+LEFT JOIN DIM_BI_STATUS STS ON s.MAX_COD_STATUS_RANKING=STS.COD_RANK
+WHERE SK_CONFIRMED_DATE > 0 
+AND DSC_BI_STATUS NOT IN ('shipped', 'stock_out', 'invalid', 'fraud','pending_finance','pending_cs', 'confirmed' )
+AND (
+        (s.SK_PENDING_CS_DATE	>= CASE WHEN TMP.SK_DATE IS NULL OR @LAST_3M_WHITELIST_START >= TMP.SK_DATE THEN @LAST_3M_WHITELIST_START ELSE TMP.SK_DATE END) OR
+        (CASE WHEN SK_CONFIRMED_DATE = '30000101' THEN -1 ELSE SK_CONFIRMED_DATE END	>= CASE WHEN TMP.SK_DATE IS NULL OR @LAST_3M_WHITELIST_START >= TMP.SK_DATE THEN @LAST_3M_WHITELIST_START ELSE TMP.SK_DATE END) OR
+        (s.sk_shipped_date		>= CASE WHEN TMP.SK_DATE IS NULL OR @LAST_3M_WHITELIST_START >= TMP.SK_DATE THEN @LAST_3M_WHITELIST_START ELSE TMP.SK_DATE END) OR
+        (s.sk_delivered_date	>= CASE WHEN TMP.SK_DATE IS NULL OR @LAST_3M_WHITELIST_START >= TMP.SK_DATE THEN @LAST_3M_WHITELIST_START ELSE TMP.SK_DATE END)
+    )
+) sub1
+ 
+WHERE  ISNULL(ISNULL(TRY_CONVERT(FLOAT, nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, nr_items), 0), 0), 0) /* succ_rate */>= @WHITELIST_SUCCESS_RATE
+AND order_desc <= 2 /*consider last two shipped orders*/ 
+ 
+GROUP BY sub1.sk_customer
+HAVING SUM (CASE
+            WHEN dsc_bi_status in ('delivered_final','delivered','returned','returned_final') THEN 1																
+            ELSE 0
+        END)=2 
+
+
+-- get customers with bad behaviour 
+SELECT b.sk_customer 
+  INTO #BLACK_LISTED_CUSTOMERS
+  FROM
+	(
+
+		SELECT A.sk_customer, a.cod_cas, a.nr_delivered_final_orders, a.nr_delivered_items,
+				  ISNULL(ISNULL(TRY_CONVERT(FLOAT, a.nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, a.nr_shipped_items), 0), 0), 0) AS succ_rate,
+				  a.nr_shipped_orders
+		   FROM
+			 (
+	 
+	 
+			 SELECT dcs.sk_customer AS sk_customer,
+					 dcs.cod_cas,
+					 COUNT(DISTINCT (CASE
+										 WHEN BI_STS.dsc_bi_status = 'delivered_final' THEN s.sk_sales_order
+										 ELSE NULL
+									 END)) AS nr_delivered_final_orders,
+					 SUM(CASE
+							 WHEN S.sk_delivered_date <> -1 THEN 1
+							 ELSE 0
+						 END) AS nr_delivered_items,
+
+					 COUNT(DISTINCT 
+						CASE WHEN s.sk_shipped_date <> -1 
+								AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+								AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+									 ( r.DSC_REASON_NAME like 'CA02%'
+									OR r.DSC_REASON_NAME like 'CA03%'
+									OR r.DSC_REASON_NAME like 'CA04%'
+									OR r.DSC_REASON_NAME like 'CA06%'
+									OR r.DSC_REASON_NAME like 'CA09%'
+									OR r.DSC_REASON_NAME like 'CA11%'
+									OR r.DSC_REASON_NAME like 'CA12%'
+									OR r.DSC_REASON_NAME like 'CA14%'
+									OR r.DSC_REASON_NAME like 'CA15%'
+									OR r.DSC_REASON_NAME like 'CA16%'
+									OR r.DSC_REASON_NAME like 'CA18%'
+									OR r.DSC_REASON_NAME like 'CA43%'
+									OR r.DSC_REASON_NAME like 'CA47%'
+									OR r.DSC_REASON_NAME like 'CA54%'
+									OR r.DSC_REASON_NAME like 'CA55%'
+									OR r.DSC_REASON_NAME like 'CA57%'
+									OR r.DSC_REASON_NAME like 'CA58%'
+									OR r.DSC_REASON_NAME like 'CA59%'
+									OR r.DSC_REASON_NAME like 'CA64%'
+									OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+																,'Customer not able to pay on delivery'
+																,'Recipient reachable but not available'
+																,'Customer is a suspect of fraud/abuse'
+																,'Recipient provided invalid address/phone number'
+																,'This is a duplicate order'
+																,'Recipient needs consolidated delivery'
+																,'Shipping Fee is High'
+																,'Found a better offer outside Jumia'
+																,'Found a better offer in Jumia'
+																,'Not interested in order anymore'
+																,'Recipient requested delivery out of SLA or did not collect within SLA'
+																,'Change delivery address/method'
+																,'Recipient wanted to open package'
+																,'Could not provide OTP'
+																,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+																,'I was testing Jumia'
+																,'Want to change voucher code'
+																)
+									  )
+									 )
+							THEN s.sk_sales_order
+							ELSE NULL 
+							END 
+						) AS nr_shipped_orders,
+
+					 COUNT(DISTINCT 
+						CASE WHEN s.sk_shipped_date <> -1 
+								AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+								AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+									 ( r.DSC_REASON_NAME like 'CA02%'
+									OR r.DSC_REASON_NAME like 'CA03%'
+									OR r.DSC_REASON_NAME like 'CA04%'
+									OR r.DSC_REASON_NAME like 'CA06%'
+									OR r.DSC_REASON_NAME like 'CA09%'
+									OR r.DSC_REASON_NAME like 'CA11%'
+									OR r.DSC_REASON_NAME like 'CA12%'
+									OR r.DSC_REASON_NAME like 'CA14%'
+									OR r.DSC_REASON_NAME like 'CA15%'
+									OR r.DSC_REASON_NAME like 'CA16%'
+									OR r.DSC_REASON_NAME like 'CA18%'
+									OR r.DSC_REASON_NAME like 'CA43%'
+									OR r.DSC_REASON_NAME like 'CA47%'
+									OR r.DSC_REASON_NAME like 'CA54%'
+									OR r.DSC_REASON_NAME like 'CA55%'
+									OR r.DSC_REASON_NAME like 'CA57%'
+									OR r.DSC_REASON_NAME like 'CA58%'
+									OR r.DSC_REASON_NAME like 'CA59%'
+									OR r.DSC_REASON_NAME like 'CA64%'
+									OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+																,'Customer not able to pay on delivery'
+																,'Recipient reachable but not available'
+																,'Customer is a suspect of fraud/abuse'
+																,'Recipient provided invalid address/phone number'
+																,'This is a duplicate order'
+																,'Recipient needs consolidated delivery'
+																,'Shipping Fee is High'
+																,'Found a better offer outside Jumia'
+																,'Found a better offer in Jumia'
+																,'Not interested in order anymore'
+																,'Recipient requested delivery out of SLA or did not collect within SLA'
+																,'Change delivery address/method'
+																,'Recipient wanted to open package'
+																,'Could not provide OTP'
+																,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+																,'I was testing Jumia'
+																,'Want to change voucher code'
+																)
+									  )
+									 )
+							THEN s.sk_sales_order_item
+							ELSE NULL 
+							END 
+						) AS nr_shipped_items
+ 
+			  FROM [dbo].[FCT_SALES_ORDER_ITEM_MARKETING] s WITH (NOLOCK)
+			  LEFT JOIN dim_customer dcs ON s.[SK_CUSTOMER] = dcs.[SK_CUSTOMER]
+			  INNER JOIN dim_bi_status bi_sts ON s.sk_bi_status = bi_sts.sk_bi_status AND dcs.cod_system = 'BOB'
+			  LEFT JOIN DIM_REASON r ON r.SK_REASON = s.SK_REASON
+			  LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = dcs.sk_customer
+			  LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = s.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
+			  WHERE s.sk_date > CASE WHEN TMP.SK_DATE IS NULL OR isnull(TWL.LAST_WL_DATE,19000101) > TMP.SK_DATE THEN isnull(TWL.LAST_WL_DATE,19000101) ELSE TMP.SK_DATE END	-- To consider the max date between the overrided whitelist customer and the last whitelist from fct_cps_indicators.
+			  GROUP BY dcs.sk_customer, dcs.cod_cas
+	) a
+) b
+LEFT JOIN #whitelist wl ON b.SK_CUSTOMER = wl.SK_CUSTOMER
+LEFT JOIN #last3m_blacklist_customers last3m on b.sk_customer = last3m.sk_customer
+--FULL JOIN #rma_abuse rmaab on b.sk_customer = rmaab.sk_customer   
+WHERE cod_cas IS NOT NULL
+AND b.sk_customer IN
+  (
+	  SELECT DISTINCT sk_customer FROM FCT_SALES_ORDER_ITEM_MARKETING WITH (NOLOCK)
+   --UNION 
+	  --SELECT sk_customer FROM #rma_abuse
+   )
+-- FILTER HERE
+AND CASE WHEN B.succ_rate < @Success_Rate_threshhold AND B.nr_shipped_orders > @Nr_shipped_orders_threshhold AND wl.SK_CUSTOMER IS NULL THEN 1 
+		 WHEN B.succ_rate < @Success_Rate_threshhold2 AND B.nr_shipped_orders > @Nr_shipped_orders_threshhold2 AND wl.SK_CUSTOMER IS NULL AND @Country IN ('DZ') THEN 1 -- PTBI-8230
+		 WHEN last3m.sk_customer is not null AND wl.SK_CUSTOMER IS NULL THEN 1 
+		 --WHEN rmaab.sk_customer is not null THEN 1	
+		 ELSE 0 END = 1
+
+
+			/* phone numbers of blacklisted customers */
+			CREATE TABLE #currently_blacklisted_phonenumbers (DSC_SALES_ORDER_PHONE nvarchar(100) /*,SK_CUSTOMER BIGINT */)
+			INSERT INTO #currently_blacklisted_phonenumbers
+			SELECT DISTINCT so.DSC_SALES_ORDER_PHONE /*, MKTG.SK_CUSTOMER */
+			FROM  V_M02_F01_FCT_SALES_ORDER_ITEM_MARKETING mktg WITH (NOLOCK) 
+			inner join DIM_SALES_ORDER so on mktg.SK_SALES_ORDER = so.SK_SALES_ORDER
+			INNER JOIN #currently_blacklisted cb on cb.sk_customer = mktg.SK_CUSTOMER
+			INNER JOIN #BLACK_LISTED_CUSTOMERS BLC ON BLC.SK_CUSTOMER = MKTG.SK_CUSTOMER -- ONLY BAD CUSTOMERS
+			LEFT JOIN #whitelist wl on cb.sk_customer = wl.sk_customer
+			WHERE mktg.SK_SHIPPED_DATE > 19000101 /*only consider shipped orders*/
+				AND mktg.sk_date>=(select cast(convert(varchar(8),dateadd(year,-1,getdate()),112) as int))
+				AND so.DSC_SALES_ORDER_PHONE is not null
+				AND wl.sk_customer is null
+				 
+			/* customer accounts that share phone number with a blacklisted customer account */
+			CREATE TABLE #blacklisted_phonenumber_customeraccounts (SK_CUSTOMER bigint /*,SK_CUSTOMER BIGINT */)
+			INSERT INTO #blacklisted_phonenumber_customeraccounts
+			SELECT DISTINCT mktg.SK_CUSTOMER/*,CB.SK_CUSTOMER */
+			FROM  V_M02_F01_FCT_SALES_ORDER_ITEM_MARKETING mktg WITH (NOLOCK) 
+			INNER JOIN DIM_SALES_ORDER so on mktg.SK_SALES_ORDER = so.SK_SALES_ORDER
+			INNER JOIN #currently_blacklisted_phonenumbers cb on cb.DSC_SALES_ORDER_PHONE = so.DSC_SALES_ORDER_PHONE
+			WHERE mktg.sk_date>=(SELECT CAST(CONVERT(VARCHAR(8),DATEADD(YEAR,-1,GETDATE()),112) AS INT))
+			
+			/**customer email blacklisted**/
+			select DSC_CUSTOMER_EMAIL_ORIGINAL , ROW_NUMBER() OVER (PARTITION BY DSC_CUSTOMER_EMAIL_ORIGINAL ORDER BY d.SK_CUSTOMER ASC) R
+			into #customer_email_original_blacklisted
+			from DIM_CUSTOMER d
+			inner join  #currently_blacklisted t on d.sk_customer = t.sk_customer
+
+			select distinct d.SK_CUSTOMER
+			into #sk_customer_email_blacklisted
+			from DIM_CUSTOMER d
+			inner join #customer_email_original_blacklisted t on d.DSC_CUSTOMER_EMAIL_ORIGINAL = t.DSC_CUSTOMER_EMAIL_ORIGINAL
+
+			CREATE TABLE #blacklisted_email_customeraccounts (SK_CUSTOMER bigint /*,SK_CUSTOMER BIGINT */)
+			INSERT INTO #blacklisted_email_customeraccounts
+			SELECT DISTINCT cb.SK_CUSTOMER/*,CB.SK_CUSTOMER */
+			FROM #sk_customer_email_blacklisted cb
+			LEFT JOIN #whitelist wl on cb.sk_customer = wl.sk_customer
+			LEFT JOIN #TMP_LAST_WHITELIST twl on cb.sk_customer = twl.sk_customer
+			LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = cb.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
+			WHERE wl.sk_customer is null 
+				AND TMP.SK_CUSTOMER is null
+				AND twl.SK_CUSTOMER is null
+
+
+
+	/* Global customers Cash on delivery Privilege */
+	--a customer is considered Global, if he has in the past bought at least one Global item. 
+	SELECT DISTINCT sk_customer 
+	INTO #global_customers
+	FROM V_M06_F01_FCT_SALES_ORDER_ITEM_SALES F 
+	INNER JOIN DIM_SALES_ORDER_ITEM d on F.sk_SALES_ORDER_ITEM=d.sk_SALES_ORDER_ITEM
+		WHERE d.FLG_FROM_GLOBAL_SELLER=1 AND items_nnn>=1
+ 
+
+
+DECLARE @start_date INT = CONVERT(VARCHAR(10), DATEADD(DAY, -30, CONVERT(DATE, GETDATE())), 112)
+
+    SELECT soif.SK_CUSTOMER, 
+      COUNT(
+       CASE WHEN  soim.SK_SHIPPED_DATE = -1 AND bi.DSC_BI_STATUS IN ('cancelled','stock_out') AND
+	              (r.DSC_REASON_NAME like 'CA02%'
+				OR r.DSC_REASON_NAME like 'CA03%'
+				OR r.DSC_REASON_NAME like 'CA05%'
+				OR r.DSC_REASON_NAME like 'CA06%'
+				OR r.DSC_REASON_NAME like 'CA08%'
+				OR r.DSC_REASON_NAME like 'CA09%'
+				OR r.DSC_REASON_NAME like 'CA10%'
+				OR r.DSC_REASON_NAME like 'CA11%'
+				OR r.DSC_REASON_NAME like 'CA14%'
+				OR r.DSC_REASON_NAME like 'CA15%'
+				OR r.DSC_REASON_NAME like 'CA16%'
+				OR r.DSC_REASON_NAME like 'CA18%'
+				OR r.DSC_REASON_NAME like 'CA44%'
+				OR r.DSC_REASON_NAME like 'CA47%'
+				OR r.DSC_REASON_NAME like 'CA57%'
+				OR r.DSC_REASON_NAME like 'CA58%'
+				OR r.DSC_REASON_NAME like 'CA59%'
+				OR r.DSC_REASON_NAME IN    (
+											'Changed mind'
+											,'Changed mode of payment'
+											,'Customer not reachable'
+											,'Decided for alternative product'
+											,'Duplicate order'
+											,'Duplicated order'
+											,'Forgot to input voucher'
+											,'Found a better offer'
+											,'Found a better offer outside Jumia'
+											,'Found cheaper alternative'
+											,'Fraud suspect'
+											,'Not interested anymore'
+											,'Other1'
+											,'Shipping fees too high'
+											,'Test order'
+											,'Voucher issue'
+											,'Wrong address'
+											,'Wrong delivery address/method'
+											,'Wrong payment method'
+											,'Wrong voucher code'
+											)) 
+			  THEN soif.SK_SALES_ORDER_ITEM
+			  ELSE NULL
+	   END
+	   ) AS QTD_CANCELLATION_ITEM,
+     COUNT(DISTINCT 
+       CASE WHEN  soim.SK_SHIPPED_DATE = -1 AND bi.DSC_BI_STATUS IN ('cancelled','stock_out') AND
+	              (r.DSC_REASON_NAME like 'CA02%'
+				OR r.DSC_REASON_NAME like 'CA03%'
+				OR r.DSC_REASON_NAME like 'CA05%'
+				OR r.DSC_REASON_NAME like 'CA06%'
+				OR r.DSC_REASON_NAME like 'CA08%'
+				OR r.DSC_REASON_NAME like 'CA09%'
+				OR r.DSC_REASON_NAME like 'CA10%'
+				OR r.DSC_REASON_NAME like 'CA11%'
+				OR r.DSC_REASON_NAME like 'CA14%'
+				OR r.DSC_REASON_NAME like 'CA15%'
+				OR r.DSC_REASON_NAME like 'CA16%'
+				OR r.DSC_REASON_NAME like 'CA18%'
+				OR r.DSC_REASON_NAME like 'CA44%'
+				OR r.DSC_REASON_NAME like 'CA47%'
+				OR r.DSC_REASON_NAME like 'CA57%'
+				OR r.DSC_REASON_NAME like 'CA58%'
+				OR r.DSC_REASON_NAME like 'CA59%'
+				OR r.DSC_REASON_NAME IN    (
+											'Changed mind'
+											,'Changed mode of payment'
+											,'Customer not reachable'
+											,'Decided for alternative product'
+											,'Duplicate order'
+											,'Duplicated order'
+											,'Forgot to input voucher'
+											,'Found a better offer'
+											,'Found a better offer outside Jumia'
+											,'Found cheaper alternative'
+											,'Fraud suspect'
+											,'Not interested anymore'
+											,'Other1'
+											,'Shipping fees too high'
+											,'Test order'
+											,'Voucher issue'
+											,'Wrong address'
+											,'Wrong delivery address/method'
+											,'Wrong payment method'
+											,'Wrong voucher code'
+											)) 
+			  THEN soif.SK_SALES_ORDER
+			  ELSE NULL
+	   END
+	   ) AS QTD_CANCELLATION_ORDER,
+	COUNT(soif.SK_SALES_ORDER_ITEM) AS QTD_TOTAL_ITEM
+	  INTO #cancellation_customers_not_jforce
+      FROM M03_F01_FCT_SALES_ORDER_ITEM_FINANCE soif 
+INNER JOIN DIM_CUSTOMER cus on cus.SK_CUSTOMER = soif.SK_CUSTOMER
+INNER JOIN FCT_SALES_ORDER_ITEM_MARKETING soim ON soif.SK_SALES_ORDER_ITEM = soim.SK_SALES_ORDER_ITEM
+ LEFT JOIN DIM_REASON r ON r.SK_REASON = soim.SK_REASON
+INNER JOIN DIM_BI_STATUS bi ON bi.SK_BI_STATUS = soim.SK_BI_STATUS
+ LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = soif.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
+ LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = soif.SK_CUSTOMER
+     WHERE cus.[DSC_ACCOUNT_TYPE] <> 'jforce' 	   
+       AND soim.SK_DATE >= (SELECT MAX(V_MAX) FROM (VALUES (TMP.SK_DATE), (TWL.LAST_WL_DATE), (@start_date)) AS value(V_MAX)) -- To consider the max date among the overrided whitelist, last whitelist and the default (last 30d).
+       AND soif.MTR_INITIAL_GROSS_ITEMS > 0
+ 
+    GROUP by soif.SK_CUSTOMER;
+
+SELECT soif.SK_CUSTOMER, 
+      COUNT(
+       CASE WHEN soim.SK_SHIPPED_DATE = -1 AND bi.DSC_BI_STATUS IN ('cancelled','stock_out') AND
+	              (r.DSC_REASON_NAME like 'CA02%'
+				OR r.DSC_REASON_NAME like 'CA03%'
+				OR r.DSC_REASON_NAME like 'CA05%'
+				OR r.DSC_REASON_NAME like 'CA06%'
+				OR r.DSC_REASON_NAME like 'CA08%'
+				OR r.DSC_REASON_NAME like 'CA09%'
+				OR r.DSC_REASON_NAME like 'CA10%'
+				OR r.DSC_REASON_NAME like 'CA11%'
+				OR r.DSC_REASON_NAME like 'CA14%'
+				OR r.DSC_REASON_NAME like 'CA15%'
+				OR r.DSC_REASON_NAME like 'CA16%'
+				OR r.DSC_REASON_NAME like 'CA18%'
+				OR r.DSC_REASON_NAME like 'CA44%'
+				OR r.DSC_REASON_NAME like 'CA47%'
+				OR r.DSC_REASON_NAME like 'CA57%'
+				OR r.DSC_REASON_NAME like 'CA58%'
+				OR r.DSC_REASON_NAME like 'CA59%'
+				OR r.DSC_REASON_NAME IN    (
+											'Changed mind'
+											,'Changed mode of payment'
+											,'Customer not reachable'
+											,'Decided for alternative product'
+											,'Duplicate order'
+											,'Duplicated order'
+											,'Forgot to input voucher'
+											,'Found a better offer'
+											,'Found a better offer outside Jumia'
+											,'Found cheaper alternative'
+											,'Fraud suspect'
+											,'Not interested anymore'
+											,'Other1'
+											,'Shipping fees too high'
+											,'Test order'
+											,'Voucher issue'
+											,'Wrong address'
+											,'Wrong delivery address/method'
+											,'Wrong payment method'
+											,'Wrong voucher code'
+											)) 
+			  THEN soif.SK_SALES_ORDER_ITEM
+			  ELSE NULL
+	   END
+	   ) AS QTD_CANCELLATION_ITEM,
+      COUNT(DISTINCT 
+       CASE WHEN  soim.SK_SHIPPED_DATE = -1 AND bi.DSC_BI_STATUS IN ('cancelled','stock_out') AND
+	              (r.DSC_REASON_NAME like 'CA02%'
+				OR r.DSC_REASON_NAME like 'CA03%'
+				OR r.DSC_REASON_NAME like 'CA05%'
+				OR r.DSC_REASON_NAME like 'CA06%'
+				OR r.DSC_REASON_NAME like 'CA08%'
+				OR r.DSC_REASON_NAME like 'CA09%'
+				OR r.DSC_REASON_NAME like 'CA10%'
+				OR r.DSC_REASON_NAME like 'CA11%'
+				OR r.DSC_REASON_NAME like 'CA14%'
+				OR r.DSC_REASON_NAME like 'CA15%'
+				OR r.DSC_REASON_NAME like 'CA16%'
+				OR r.DSC_REASON_NAME like 'CA18%'
+				OR r.DSC_REASON_NAME like 'CA44%'
+				OR r.DSC_REASON_NAME like 'CA47%'
+				OR r.DSC_REASON_NAME like 'CA57%'
+				OR r.DSC_REASON_NAME like 'CA58%'
+				OR r.DSC_REASON_NAME like 'CA59%'
+				OR r.DSC_REASON_NAME IN    (
+											'Changed mind'
+											,'Changed mode of payment'
+											,'Customer not reachable'
+											,'Decided for alternative product'
+											,'Duplicate order'
+											,'Duplicated order'
+											,'Forgot to input voucher'
+											,'Found a better offer'
+											,'Found a better offer outside Jumia'
+											,'Found cheaper alternative'
+											,'Fraud suspect'
+											,'Not interested anymore'
+											,'Other1'
+											,'Shipping fees too high'
+											,'Test order'
+											,'Voucher issue'
+											,'Wrong address'
+											,'Wrong delivery address/method'
+											,'Wrong payment method'
+											,'Wrong voucher code'
+											)) 
+			  THEN soif.SK_SALES_ORDER
+			  ELSE NULL
+	   END
+	   ) AS QTD_CANCELLATION_ORDER,
+       COUNT(soif.SK_SALES_ORDER_ITEM) AS QTD_TOTAL_ITEM, 
+	   COUNT(DISTINCT soif.SK_SALES_ORDER) AS QTD_TOTAL_ORDER
+	  INTO #cancellation_customers_jforce
+      FROM M03_F01_FCT_SALES_ORDER_ITEM_FINANCE soif 
+	  INNER JOIN DIM_CUSTOMER cus on cus.SK_CUSTOMER = soif.SK_CUSTOMER
+	  INNER JOIN FCT_SALES_ORDER_ITEM_MARKETING soim ON soif.SK_SALES_ORDER_ITEM = soim.SK_SALES_ORDER_ITEM
+ LEFT JOIN DIM_REASON r ON r.SK_REASON = soim.SK_REASON
+INNER JOIN DIM_BI_STATUS bi ON bi.SK_BI_STATUS = soim.SK_BI_STATUS
+ LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = soif.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
+ LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = soif.SK_CUSTOMER
+     WHERE cus.[DSC_ACCOUNT_TYPE] ='jforce' 	   
+       AND soim.SK_DATE >= (SELECT MAX(V_MAX) FROM (VALUES (TMP.SK_DATE), (TWL.LAST_WL_DATE), (@start_date)) AS value(V_MAX)) -- To consider the max date among the overrided whitelist, last whitelist and the default (last 30d).
+       AND soif.MTR_INITIAL_GROSS_ITEMS > 0
+
+    GROUP by soif.SK_CUSTOMER;
+
+
+SELECT SK_CUSTOMER, QTD_CANCELLATION_ITEM, QTD_CANCELLATION_ORDER, MTR_CANCELLATION_RATE
+INTO #cancellation_customers
+FROM (select distinct sk_customer,
+                      QTD_CANCELLATION_ITEM,
+					  QTD_CANCELLATION_ORDER AS QTD_CANCELLATION_ORDER,
+					  ISNULL(TRY_CONVERT(FLOAT, QTD_CANCELLATION_ITEM), 0) / TRY_CONVERT(FLOAT, QTD_TOTAL_ITEM) AS MTR_CANCELLATION_RATE
+        from #cancellation_customers_not_jforce
+	   where isnull(QTD_TOTAL_ITEM,0) > 0 
+	     and (
+		     (QTD_CANCELLATION_ITEM >= @CPS_CANCELLATION_ITEMS) or
+	         (ISNULL(TRY_CONVERT(FLOAT, QTD_CANCELLATION_ITEM), 0) / TRY_CONVERT(FLOAT, QTD_TOTAL_ITEM) >= @CPS_CANCELLATION_RATE 
+			  AND QTD_CANCELLATION_ORDER >= @CPS_CANCELLATION_ORDERS)
+			 )
+		union
+	  select distinct sk_customer,
+                      QTD_CANCELLATION_ITEM,
+					  QTD_CANCELLATION_ORDER,
+					  ISNULL(TRY_CONVERT(FLOAT, QTD_CANCELLATION_ITEM), 0) / TRY_CONVERT(FLOAT, QTD_TOTAL_ITEM) AS MTR_CANCELLATION_RATE
+	    from #cancellation_customers_jforce
+	   where isnull(QTD_TOTAL_ITEM,0) > 0 
+	     and (
+		     (QTD_CANCELLATION_ITEM >= @CPS_CANCELLATION_ITEMS_JFORCE) or
+	         (ISNULL(TRY_CONVERT(FLOAT, QTD_CANCELLATION_ITEM), 0) / TRY_CONVERT(FLOAT, QTD_TOTAL_ITEM) >= @CPS_CANCELLATION_RATE_JFORCE 
+			  AND QTD_CANCELLATION_ORDER >= @CPS_CANCELLATION_ORDERS_JFORCE)			 
+			 )
+	 ) a;
+
+SELECT
+	SK_CUSTOMER
+INTO #INC_CUSTOMER
+FROM(
+	SELECT DISTINCT SK_CUSTOMER
+	FROM FCT_SALES_ORDER_ITEM_MARKETING WITH (NOLOCK)
+	WHERE SK_DATE > @minDate or SK_AUD_INSERT >= @SK_AUD_increment
+   
+	UNION 
+ 
+	SELECT SK_CUSTOMER FROM #blacklisted_phonenumber_customeraccounts
+ 
+	--UNION 
+ 
+	--SELECT SK_CUSTOMER FROM #rma_abuse
+   
+	UNION
+
+	SELECT SK_CUSTOMER FROM #cancellation_customers
+
+	UNION
+
+	SELECT SK_CUSTOMER FROM #TMP_CPS_OVERRIDE
+	UNION 
+ 
+	SELECT SK_CUSTOMER FROM #blacklisted_email_customeraccounts
+) innerQ
+  
+/*** MAIN INSERT STARTS HERE ***/
+SELECT 
+		b.sk_customer,
+		CONVERT(
+			NVARCHAR(32), 
+			CASE
+				WHEN badphone.SK_CUSTOMER IS NOT NULL AND wl.SK_CUSTOMER is null AND isnull(dsc_account_type,'') <> 'jforce' THEN 'OFF'  /* customer accounts can be blacklisted also if they have less than 6 shipped orders, in case they share phone number with a blacklisted customer account. Once they have more than 5 shipped orders, they begin to be considered on their own merits */
+				WHEN last3m.sk_customer IS NOT NULL AND wl.SK_CUSTOMER IS NULL THEN 'OFF' /* customer accounts will be blocked if have cps bad behaviour on last 3 months */
+				--WHEN rmaab.sk_customer is not null THEN 'OFF'	/*abuse of RMA*/
+				WHEN canc.sk_customer IS NOT NULL AND wl.sk_customer IS NULL THEN 'OFF'
+				WHEN bademail.SK_CUSTOMER IS NOT NULL AND wl.SK_CUSTOMER is null  THEN 'OFF'
+				WHEN CB.sk_customer IS NOT NULL AND wl.SK_CUSTOMER is null  THEN 'OFF' -- currenttly blacklisted + not flagged for whitelisting - keep as is
+
+				WHEN OVERRIDEN.SK_Customer IS NOT NULL AND OVERRIDEN.MTR_VALUE = 'OFF' AND wl.sk_customer IS NULL THEN 'OFF' -- overridden to be OFF
+				WHEN OVERRIDEN.SK_Customer IS NOT NULL AND OVERRIDEN.MTR_VALUE = 'ON' THEN 'ON' -- overrideen to be ON
+			ELSE 
+				'ON' 
+			END
+		) AS POSTPAYMENT,
+	
+		CONVERT(date, CONVERT(VARCHAR(8), Getdate(), 112)) AS date_created,
+		dd_cod_customer,
+       
+		CASE
+			WHEN wl.SK_CUSTOMER IS NOT NULL THEN 1
+			ELSE 0
+		END AS FLG_WHITELIST,
+			
+		CASE
+			WHEN badphone.SK_CUSTOMER IS NOT NULL AND isnull(dsc_account_type,'') <> 'jforce' THEN 1
+			ELSE 0
+		END AS FLG_PHONE_BLACKLIST,
+
+		CASE
+			WHEN bademail.SK_CUSTOMER IS NOT NULL THEN 1
+			ELSE 0
+		END AS FLG_EMAIL_BLACKLIST,
+
+		CASE 
+			WHEN canc.sk_customer IS NOT NULL THEN 1 
+			ELSE 0 
+		END AS FLG_CANCELLATION_BLACKLIST,
+
+		CASE 
+			WHEN last3m.sk_customer IS NOT NULL THEN 1 
+			ELSE 0 
+		END AS FLG_LAST_3M_PERF_BLACKLIST,
+
+		NULL AS FLG_SR_BLACKLIST,
+
+		CASE
+			WHEN 
+				OVERRIDEN.SK_Customer IS NOT NULL 
+				AND OVERRIDEN.MTR_VALUE = 'OFF'
+				AND wl.sk_customer IS NULL
+				AND badphone.SK_CUSTOMER IS NULL
+				AND last3m.sk_customer IS NULL
+				AND canc.sk_customer IS NULL
+				AND bademail.SK_CUSTOMER IS NULL
+				AND CB.sk_customer IS NULL
+				THEN 1
+			WHEN 
+				OVERRIDEN.SK_Customer IS NOT NULL 
+				AND OVERRIDEN.MTR_VALUE = 'ON'
+				THEN 1
+			ELSE 0
+		END AS FLG_OVERRIDED_VALUE,
+ 	
+	   CONVERT(NVARCHAR(32),
+	    CASE WHEN @Country in ('NG','EG','KE') THEN
+		   CASE WHEN Global_customer = 1 and dsc_account_type in ('customer','b2b account manager','jforce')
+					THEN 
+						CASE WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_3_orders 
+								and nr_shipped_orders >= 3 THEN 'ON'
+							WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_global_customers_1_order 
+								and nr_shipped_orders >= 1 THEN 'ON'	
+							ELSE 'OFF' end
+				WHEN Global_customer = 0 and dsc_account_type in ('customer')
+					then 
+						CASE WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_3_orders 
+								and nr_shipped_orders >= 3 THEN 'ON'	
+							ELSE 'OFF' end 
+				END		
+		 WHEN @Country in ('DZ','TN','SN','UG','GH') THEN
+		   CASE WHEN Global_customer = 1 and dsc_account_type in ('customer','b2b account manager','jforce')
+					then 
+						CASE WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_global_customers_100_order 
+								and nr_shipped_orders >= 100 THEN 'ON'
+							WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_global_customers_50_order 
+								and nr_shipped_orders >= 50 THEN 'ON'	
+							ELSE 'OFF' end
+				WHEN Global_customer = 0 AND dsc_account_type IN ('customer')
+					then 
+						CASE WHEN succ_rate >= @GlobalPostpayment_Success_Rate_threshhold_global_customers_100_order 
+								and nr_shipped_orders >= 100 THEN 'ON'	
+							ELSE 'OFF' END 
+				END	
+
+		  ELSE NULL END)	
+				AS GLOBAL_POSTPAYMENT_PRIVILEGE			-- currently only activated for NG,EG,KE
+				    
+		,NULL AS FLG_RMA_abuse 		/*abuse of RMA*/
+		,succ_rate AS MTR_SUCCESS_RATE
+		,canc.QTD_CANCELLATION_ORDER AS MTR_CANCELLATION_ORDER
+		,canc.QTD_CANCELLATION_ITEM AS MTR_CANCELLATION_ITEM
+		,canc.MTR_CANCELLATION_RATE AS MTR_CANCELLATION_RATE
+
+INTO #final_insert
+FROM
+  (SELECT sk_customer,
+          cod_cas,
+          nr_delivered_final_orders,
+          nr_delivered_items,
+          ISNULL(ISNULL(TRY_CONVERT(FLOAT, nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, nr_shipped_items), 0), 0), 0) AS succ_rate,
+          dsc_customer_type,
+          dsc_account_type,
+          nr_shipped_orders,
+          dd_cod_customer,
+		  Global_customer
+   FROM
+     (SELECT dcs.sk_customer AS sk_customer,
+             dcs.cod_cas,
+             COUNT(DISTINCT (CASE
+                                 WHEN dsc_bi_status = 'delivered_final' THEN s.sk_sales_order
+                                 ELSE NULL
+                             END)) AS nr_delivered_final_orders,
+             SUM(CASE
+                     WHEN sk_delivered_date <> -1 THEN 1
+                     ELSE 0
+                 END) AS nr_delivered_items,
+
+			COUNT(DISTINCT 
+			CASE WHEN s.sk_shipped_date <> -1 
+					AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+					AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+							( r.DSC_REASON_NAME like 'CA02%'
+						OR r.DSC_REASON_NAME like 'CA03%'
+						OR r.DSC_REASON_NAME like 'CA04%'
+						OR r.DSC_REASON_NAME like 'CA06%'
+						OR r.DSC_REASON_NAME like 'CA09%'
+						OR r.DSC_REASON_NAME like 'CA11%'
+						OR r.DSC_REASON_NAME like 'CA12%'
+						OR r.DSC_REASON_NAME like 'CA14%'
+						OR r.DSC_REASON_NAME like 'CA15%'
+						OR r.DSC_REASON_NAME like 'CA16%'
+						OR r.DSC_REASON_NAME like 'CA18%'
+						OR r.DSC_REASON_NAME like 'CA43%'
+						OR r.DSC_REASON_NAME like 'CA47%'
+						OR r.DSC_REASON_NAME like 'CA54%'
+						OR r.DSC_REASON_NAME like 'CA55%'
+						OR r.DSC_REASON_NAME like 'CA57%'
+						OR r.DSC_REASON_NAME like 'CA58%'
+						OR r.DSC_REASON_NAME like 'CA59%'
+						OR r.DSC_REASON_NAME like 'CA64%'
+						OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+													,'Customer not able to pay on delivery'
+													,'Recipient reachable but not available'
+													,'Customer is a suspect of fraud/abuse'
+													,'Recipient provided invalid address/phone number'
+													,'This is a duplicate order'
+													,'Recipient needs consolidated delivery'
+													,'Shipping Fee is High'
+													,'Found a better offer outside Jumia'
+													,'Found a better offer in Jumia'
+													,'Not interested in order anymore'
+													,'Recipient requested delivery out of SLA or did not collect within SLA'
+													,'Change delivery address/method'
+													,'Recipient wanted to open package'
+													,'Could not provide OTP'
+													,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+													,'I was testing Jumia'
+													,'Want to change voucher code'
+													)
+							)
+							)
+				THEN s.sk_sales_order
+				ELSE NULL 
+				END 
+			) AS nr_shipped_orders,
+
+			COUNT(DISTINCT 
+			CASE WHEN s.sk_shipped_date <> -1 
+					AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
+					AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
+							( r.DSC_REASON_NAME like 'CA02%'
+						OR r.DSC_REASON_NAME like 'CA03%'
+						OR r.DSC_REASON_NAME like 'CA04%'
+						OR r.DSC_REASON_NAME like 'CA06%'
+						OR r.DSC_REASON_NAME like 'CA09%'
+						OR r.DSC_REASON_NAME like 'CA11%'
+						OR r.DSC_REASON_NAME like 'CA12%'
+						OR r.DSC_REASON_NAME like 'CA14%'
+						OR r.DSC_REASON_NAME like 'CA15%'
+						OR r.DSC_REASON_NAME like 'CA16%'
+						OR r.DSC_REASON_NAME like 'CA18%'
+						OR r.DSC_REASON_NAME like 'CA43%'
+						OR r.DSC_REASON_NAME like 'CA47%'
+						OR r.DSC_REASON_NAME like 'CA54%'
+						OR r.DSC_REASON_NAME like 'CA55%'
+						OR r.DSC_REASON_NAME like 'CA57%'
+						OR r.DSC_REASON_NAME like 'CA58%'
+						OR r.DSC_REASON_NAME like 'CA59%'
+						OR r.DSC_REASON_NAME like 'CA64%'
+						OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
+													,'Customer not able to pay on delivery'
+													,'Recipient reachable but not available'
+													,'Customer is a suspect of fraud/abuse'
+													,'Recipient provided invalid address/phone number'
+													,'This is a duplicate order'
+													,'Recipient needs consolidated delivery'
+													,'Shipping Fee is High'
+													,'Found a better offer outside Jumia'
+													,'Found a better offer in Jumia'
+													,'Not interested in order anymore'
+													,'Recipient requested delivery out of SLA or did not collect within SLA'
+													,'Change delivery address/method'
+													,'Recipient wanted to open package'
+													,'Could not provide OTP'
+													,'Customer is a suspect of fraud/abuse by JPay Risk Team'
+													,'I was testing Jumia'
+													,'Want to change voucher code'
+													)
+							)
+							)
+				THEN s.sk_sales_order_item
+				ELSE NULL 
+				END 
+			) AS nr_shipped_items,
+
+             dsc_customer_type,
+             dsc_account_type,
+             cod_customer AS dd_cod_customer,
+			 case when global_customers.SK_CUSTOMER is not null then 1 else 0 end as Global_customer
+ 
+      FROM [dbo].[FCT_SALES_ORDER_ITEM_MARKETING] s WITH (NOLOCK)
+	  -- PTBI-8501 - changed the WHERE clause down below with a IN clause to this JOIN with a temp table. This filters the SK_CUSTOMERS as well and with less execution time
+	  JOIN #INC_CUSTOMER INC ON s.SK_CUSTOMER = INC.SK_CUSTOMER
+      LEFT JOIN dim_customer dcs ON s.[SK_CUSTOMER] = dcs.[SK_CUSTOMER]
+	  LEFT JOIN DIM_REASON r ON r.SK_REASON = s.SK_REASON
+	  LEFT JOIN #global_customers global_customers ON s.SK_CUSTOMER = global_customers.SK_CUSTOMER
+      INNER JOIN dim_bi_status bi_sts ON s.sk_bi_status = bi_sts.sk_bi_status
+                                     AND dcs.cod_system = 'BOB'
+	  LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = s.SK_CUSTOMER
+      WHERE s.sk_date > isnull(TWL.LAST_WL_DATE, 19000101) /* after a customer is whitelisted, the counter shall be reset */
+			
+      GROUP BY dcs.sk_customer,
+               dcs.cod_cas,
+               dsc_customer_type,
+               dsc_account_type,
+               cod_customer,
+			   global_customers.sk_customer) a) b
+LEFT JOIN #whitelist wl ON b.SK_CUSTOMER = wl.SK_CUSTOMER
+LEFT JOIN #blacklisted_phonenumber_customeraccounts badphone on b.SK_CUSTOMER = badphone.SK_CUSTOMER
+LEFT JOIN #blacklisted_email_customeraccounts bademail on b.SK_CUSTOMER = bademail.SK_CUSTOMER
+LEFT JOIN #last3m_blacklist_customers last3m on b.sk_customer = last3m.sk_customer
+LEFT JOIN #cancellation_customers canc on canc.sk_customer=b.sk_customer
+LEFT JOIN #currently_blacklisted CB on CB.sk_customer=b.sk_customer
+LEFT JOIN (
+	SELECT 
+		TMP_OVR.SK_CUSTOMER,
+		TMP_OVR.MTR_VALUE
+	FROM #TMP_CPS_OVERRIDE TMP_OVR
+	LEFT JOIN DBO.FCT_CPS_INDICATORS CPS ON 
+					CPS.SK_CUSTOMER = TMP_OVR.SK_CUSTOMER
+                                    	AND CPS.DD_DIMENSION = 'POSTPAYMENT'
+					AND CPS.SK_DATE > TMP_OVR.SK_DATE
+	WHERE CPS.SK_CUSTOMER IS NULL AND TMP_OVR.DIMENSION = 'POSTPAYMENT'
+) OVERRIDEN ON OVERRIDEN.SK_CUSTOMER = b.SK_CUSTOMER
+WHERE cod_cas IS NOT NULL
+
+ 
+SELECT 
+DISTINCT SK_CUSTOMER
+INTO #TBT_JPAY_CUSTOMERS_TO_CONSIDER
+FROM FCT_SALES_ORDER_ITEM_MARKETING AS fctSOI
+WHERE fctSOI.SK_BI_STATUS NOT IN (1,2) AND fctSOI.SK_DATE>= @minJPSegmentDate
+AND fctSOI.SK_CUSTOMER NOT IN (-1) AND fctSOI.SK_CUSTOMER IS NOT NULL
+ 
+
+DELETE FROM [FCT_CPS_INDICATORS] WHERE [SK_DATE]=FORMAT(GETDATE(),'yyyyMMdd') AND DD_DIMENSION <> 'CUSTOMERCLASS';
+
+
+DROP TABLE IF EXISTS #CPS_Last_Insert
+SELECT *
+INTO #CPS_Last_Insert
+FROM (
+    SELECT 
+          CPS.SK_CUSTOMER
+        , CPS.MTR_VALUE
+        , FLG_WHITELIST
+        , FLG_PHONE_BLACKLIST
+        , FLG_EMAIL_BLACKLIST
+        , FLG_RMA_abuse
+        , FLG_CANCELLATION_BLACKLIST
+        , FLG_SR_BLACKLIST
+        , FLG_LAST_3M_PERF_BLACKLIST
+        , FLG_OVERRIDED_VALUE
+        , ROW_NUMBER() OVER(PARTITION BY CPS.SK_CUSTOMER ORDER BY CPS.SK_DATE DESC) ORDEM
+    FROM DBO.FCT_CPS_INDICATORS CPS
+    WHERE --SK_DATE >= @minDate 
+	CPS.DD_DIMENSION = 'POSTPAYMENT'
+)
+q1 
+WHERE q1.ORDEM = 1
+
+DROP TABLE IF EXISTS #PRE_FINAL
+SELECT FORMAT(date_created,'yyyyMMdd') AS SK_DATE
+      ,dic.SK_CPS_DIMENSION
+      ,u.SK_CUSTOMER
+      ,[DD_DIMENSION]
+      ,[MTR_VALUE]
+      ,@SK_AUD as [SK_AUD_INSERT]
+      ,NULL as [SK_AUD_PUSH]
+      ,[DD_COD_CUSTOMER]
+      ,[FLG_WHITELIST]
+      ,[FLG_PHONE_BLACKLIST]
+		,[FLG_EMAIL_BLACKLIST]
+	  ,FLG_RMA_abuse
+	  ,u.FLG_CANCELLATION_BLACKLIST
+	  ,u.FLG_SR_BLACKLIST
+	  ,u.FLG_LAST_3M_PERF_BLACKLIST
+	  ,u.MTR_SUCCESS_RATE
+	  ,u.MTR_CANCELLATION_ORDER
+	  ,u.MTR_CANCELLATION_ITEM
+	  ,u.MTR_CANCELLATION_RATE
+	  ,[FLG_OVERRIDED_VALUE]
+INTO #PRE_FINAL
+FROM #final_insert fi
+ --) s
+	UNPIVOT (
+	MTR_value
+	FOR DD_DIMENSION in (POSTPAYMENT, GLOBAL_POSTPAYMENT_PRIVILEGE
+				)
+) u
+LEFT JOIN V_D98_DIM_CPS_OVERRIDE dic on u.[DD_DIMENSION]=dic.DSC_CPS_DIMENSION
+LEFT JOIN #blacklisted_email_customeraccounts bademail ON bademail.SK_CUSTOMER = u.SK_CUSTOMER
+
+UNION ALL
+
+SELECT
+FORMAT(CONVERT(DATE, CONVERT(VARCHAR(8), GETDATE(), 112)),'yyyyMMdd') AS date_created
+,3 AS SK_CPS_DIMENSION
+,innerQ2.SK_CUSTOMER
+,'dim_12' AS [DD_DIMENSION]
+,CASE  WHEN MAX(innerQ2.FLG_HAS_USED_JPAY) IS NULL THEN 'JPSEG001'
+	  WHEN SUM(MTR_JPAY_PAYMENT) > 0 THEN 'JPSEG002'
+	  ELSE 'JPSEG003' END AS [MTR_VALUE]
+,@SK_AUD AS [SK_AUD_INSERT]
+,NULL AS [SK_AUD_PUSH]
+,[dimCust].COD_CUSTOMER AS [DD_COD_CUSTOMER]
+,NULL AS [FLG_WHITELIST]
+,NULL AS [FLG_PHONE_BLACKLIST]
+,CASE
+	WHEN bademail.SK_CUSTOMER IS NOT NULL THEN 1
+	ELSE 0
+END AS FLG_EMAIL_BLACKLIST
+,NULL AS FLG_RMA_abuse
+,NULL AS FLG_CANCELLATION_BLACKLIST
+,NULL AS FLG_SR_BLACKLIST
+,NULL AS FLG_LAST_3M_PERF_BLACKLIST
+,NULL AS MTR_SUCCESS_RATE
+,NULL AS MTR_CANCELLATION_ORDER
+,NULL AS MTR_CANCELLATION_ITEM
+,NULL AS MTR_CANCELLATION_RATE
+,0 AS FLG_OVERRIDED_VALUE
+FROM
+(
+	SELECT 
+		innerQ1.SK_CUSTOMER,
+		innerQ1.SK_SALES_ORDER,
+		innerQ1.MTR_JPAY_PAYMENT,
+		innerQ1.DSC_PAYMENT_OPTION_DESCRIPTION,
+		MAX(innerQ1.SK_PAYMENT_OPTION) OVER(PARTITION BY innerQ1.SK_CUSTOMER) AS FLG_HAS_USED_JPAY,  -- Get max payment option, this will help to assure if the customer already used successfully JPAY and propagate it to all dataset
+		ROW_NUMBER() OVER(PARTITION BY innerQ1.SK_CUSTOMER ORDER BY innerQ1.SK_DATE DESC, innerQ1.SK_TIME DESC ) AS ROW_NBR -- Used to get the last 2 valid orders for a specific customer, filter after the inner query
+		FROM(
+			SELECT
+				fctSOI.SK_CUSTOMER,
+				fctSOI.SK_SALES_ORDER,
+				MAX(fctSOI.SK_DATE) AS SK_DATE,
+				MAX(fctSOI.SK_TIME) AS SK_TIME,
+				CASE WHEN MAX(dimPO.SK_PAYMENT_OPTION) IS NOT NULL THEN 1 ELSE 0 END MTR_JPAY_PAYMENT, -- This supports the segmentation process after the innerQ
+				dimPO.DSC_PAYMENT_OPTION_DESCRIPTION,
+				MAX(dimPO.SK_PAYMENT_OPTION) AS SK_PAYMENT_OPTION				 
+			FROM FCT_SALES_ORDER_ITEM_MARKETING AS fctSOI
+			INNER JOIN dbo.FCT_SALES_ORDER AS fctSO on fctSO.SK_SALES_ORDER = fctSOI.SK_SALES_ORDER
+			LEFT JOIN dbo.DIM_PAYMENT_OPTION AS dimPO ON dimPO.SK_PAYMENT_OPTION = fctSO.SK_PAYMENT_OPTION AND 
+															(dimPO.DSC_PAYMENT_OPTION_DESCRIPTION LIKE '%JumiaPay%' OR dimPO.DSC_PAYMENT_OPTION_DESCRIPTION LIKE '%Jumia_Pay%')
+			WHERE fctSOI.SK_BI_STATUS NOT IN (1,2)
+					AND fctSOI.SK_CUSTOMER IN (SELECT SK_CUSTOMER FROM #TBT_JPAY_CUSTOMERS_TO_CONSIDER)
+			GROUP BY fctSOI.SK_CUSTOMER, fctSOI.SK_SALES_ORDER, dimPO.DSC_PAYMENT_OPTION_DESCRIPTION
+			) AS innerQ1			
+) AS innerQ2
+INNER JOIN DIM_CUSTOMER AS dimCust ON dimCust.SK_CUSTOMER = innerQ2.SK_CUSTOMER
+LEFT JOIN #blacklisted_email_customeraccounts bademail ON bademail.SK_CUSTOMER = innerQ2.SK_CUSTOMER
+WHERE innerQ2.ROW_NBR <= 2
+GROUP BY innerQ2.SK_CUSTOMER, [dimCust].COD_CUSTOMER,bademail.SK_CUSTOMER
+
+UNION ALL
+
+SELECT
+FORMAT(CONVERT(DATE, CONVERT(VARCHAR(8), GETDATE(), 112)),'yyyyMMdd') AS date_created
+,DIM.SK_CPS_DIMENSION
+,TMP_OVR.SK_CUSTOMER
+,TMP_OVR.DIMENSION
+,TMP_OVR.MTR_VALUE
+,@SK_AUD AS [SK_AUD_INSERT]
+,NULL AS [SK_AUD_PUSH]
+,DC.COD_CUSTOMER
+,NULL AS [FLG_WHITELIST]
+,NULL AS [FLG_PHONE_BLACKLIST]
+,CASE
+	WHEN bademail.SK_CUSTOMER IS NOT NULL THEN 1
+	ELSE 0
+END AS FLG_EMAIL_BLACKLIST
+,NULL AS FLG_RMA_abuse
+,NULL AS FLG_CANCELLATION_BLACKLIST
+,NULL AS FLG_SR_BLACKLIST
+,NULL AS FLG_LAST_3M_PERF_BLACKLIST
+,NULL AS MTR_SUCCESS_RATE
+,NULL AS MTR_CANCELLATION_ORDER
+,NULL AS MTR_CANCELLATION_ITEM
+,NULL AS MTR_CANCELLATION_RATE
+,1 AS FLG_OVERRIDED_VALUE
+FROM #TMP_CPS_OVERRIDE TMP_OVR
+LEFT JOIN V_D98_DIM_CPS_OVERRIDE DIM on DIM.DSC_CPS_DIMENSION = TMP_OVR.DIMENSION
+LEFT JOIN DIM_CUSTOMER AS DC ON DC.SK_CUSTOMER = TMP_OVR.SK_CUSTOMER
+LEFT JOIN #final_insert FI ON FI.sk_customer = TMP_OVR.SK_CUSTOMER
+LEFT JOIN DBO.FCT_CPS_INDICATORS CPS ON CPS.SK_CUSTOMER = TMP_OVR.SK_CUSTOMER
+                                    AND CPS.DD_DIMENSION = 'POSTPAYMENT'
+									AND CPS.SK_DATE > TMP_OVR.SK_DATE
+LEFT JOIN #blacklisted_email_customeraccounts bademail ON bademail.SK_CUSTOMER = TMP_OVR.SK_CUSTOMER
+WHERE FI.sk_customer IS NULL 
+  AND CPS.SK_CUSTOMER IS NULL
+
+UNION ALL
+
+SELECT
+FORMAT(CONVERT(DATE, CONVERT(VARCHAR(8), GETDATE(), 112)),'yyyyMMdd') AS date_created
+,DIM.SK_CPS_DIMENSION
+,bademail.SK_CUSTOMER
+,DIM.DSC_CPS_DIMENSION AS DIMENSION
+,'OFF' as MTR_VALUE
+,@SK_AUD AS [SK_AUD_INSERT]
+,NULL AS [SK_AUD_PUSH]
+,DC.COD_CUSTOMER
+,NULL AS [FLG_WHITELIST]
+,NULL AS [FLG_PHONE_BLACKLIST]
+,1	  AS [FLG_EMAIL_BLACKLIST]
+,NULL AS FLG_RMA_abuse
+,NULL AS FLG_CANCELLATION_BLACKLIST
+,NULL AS FLG_SR_BLACKLIST
+,NULL AS FLG_LAST_3M_PERF_BLACKLIST
+,NULL AS MTR_SUCCESS_RATE
+,NULL AS MTR_CANCELLATION_ORDER
+,NULL AS MTR_CANCELLATION_ITEM
+,NULL AS MTR_CANCELLATION_RATE
+,0 AS FLG_OVERRIDED_VALUE
+FROM  #blacklisted_email_customeraccounts bademail 
+LEFT JOIN DIM_CUSTOMER AS DC ON DC.SK_CUSTOMER = bademail.SK_CUSTOMER
+LEFT JOIN V_D98_DIM_CPS_OVERRIDE DIM on DIM.DSC_CPS_DIMENSION = 'POSTPAYMENT'
+LEFT JOIN #final_insert FI ON FI.sk_customer = bademail.SK_CUSTOMER
+WHERE FI.sk_customer IS NULL 
+
+--Delete from pre_final all the records whose flgs didn't change since last insert 
+DELETE FIN
+FRom #PRE_FINAL FIN 
+inner JOIN #CPS_Last_Insert LI 
+ON LI.SK_CUSTOMER = fIn.SK_CUSTOMER 
+WHERE  
+    --COALESCE(LI.FLG_WHITELIST,0)				= COALESCE(FIN.FLG_WHITELIST,0)
+    COALESCE(LI.FLG_PHONE_BLACKLIST,0)			= COALESCE(FIN.FLG_PHONE_BLACKLIST,0)
+    and COALESCE(LI.FLG_EMAIL_BLACKLIST,0)			= COALESCE(FIN.FLG_EMAIL_BLACKLIST,0)
+    and COALESCE(LI.FLG_RMA_abuse,0)				= COALESCE(FIN.FLG_RMA_abuse,0)
+    and COALESCE(LI.FLG_CANCELLATION_BLACKLIST,0)	= COALESCE(FIN.FLG_CANCELLATION_BLACKLIST,0)
+    and COALESCE(LI.FLG_SR_BLACKLIST,0)				= COALESCE(FIN.FLG_SR_BLACKLIST,0)
+    and COALESCE(LI.FLG_LAST_3M_PERF_BLACKLIST,0)	= COALESCE(FIN.FLG_LAST_3M_PERF_BLACKLIST,0)
+    and COALESCE(LI.FLG_OVERRIDED_VALUE,0)			= COALESCE(FIN.FLG_OVERRIDED_VALUE,0)
+    and LI.MTR_VALUE = FIN.MTR_value 
+
+
+INSERT INTO [FCT_CPS_INDICATORS] ( 
+	   [SK_DATE]
+      ,[SK_CPS_OVERRIDE]
+      ,[SK_CUSTOMER]
+      ,[DD_DIMENSION]
+      ,[MTR_VALUE]
+      ,[SK_AUD_INSERT]
+      ,[SK_AUD_PUSH]
+      ,[DD_COD_CUSTOMER]
+      ,[FLG_WHITELIST]
+      ,[FLG_PHONE_BLACKLIST]
+      ,[FLG_EMAIL_BLACKLIST]
+	  ,FLG_RMA_abuse
+	  ,[FLG_CANCELLATION_BLACKLIST]
+	  ,[FLG_SR_BLACKLIST]
+	  ,[FLG_LAST_3M_PERF_BLACKLIST]
+	  ,[MTR_SUCCESS_RATE]
+	  ,[MTR_CANCELLATION_ORDER]
+	  ,[MTR_CANCELLATION_ITEM]
+	  ,[MTR_CANCELLATION_RATE]
+	  ,[FLG_OVERRIDED_VALUE]
+)
+SELECT 
+	   [SK_DATE]
+      ,[SK_CPS_DIMENSION] AS SK_CPS_OVERRIDE
+      ,[SK_CUSTOMER]
+      ,[DD_DIMENSION]
+      ,[MTR_VALUE]
+      ,[SK_AUD_INSERT]
+      ,[SK_AUD_PUSH]
+      ,[DD_COD_CUSTOMER]
+      ,[FLG_WHITELIST]
+      ,[FLG_PHONE_BLACKLIST]
+      ,[FLG_EMAIL_BLACKLIST]
+	  ,[FLG_RMA_abuse]
+	  ,[FLG_CANCELLATION_BLACKLIST]
+	  ,[FLG_SR_BLACKLIST]
+	  ,[FLG_LAST_3M_PERF_BLACKLIST]
+	  ,[MTR_SUCCESS_RATE]
+	  ,[MTR_CANCELLATION_ORDER]
+	  ,[MTR_CANCELLATION_ITEM]
+	  ,[MTR_CANCELLATION_RATE]
+	  ,[FLG_OVERRIDED_VALUE]
+FROM #PRE_FINAL
+
+ 
+DROP TABLE IF EXISTS #currently_blacklisted;  
+DROP TABLE IF EXISTS #whitelist;  
+DROP TABLE IF EXISTS #last3m_blacklist_customers;  
+DROP TABLE IF EXISTS #currently_blacklisted_phonenumbers;  
+DROP TABLE IF EXISTS #blacklisted_phonenumber_customeraccounts;  
+DROP TABLE IF EXISTS #blacklisted_email_customeraccounts;  
+DROP TABLE IF EXISTS #final_insert;  
+DROP TABLE IF EXISTS #global_customers;  
+--DROP TABLE IF EXISTS #rma_abuse;  
+DROP TABLE IF EXISTS #BLACK_LISTED_CUSTOMERS;
+DROP TABLE IF EXISTS #TBT_JPAY_CUSTOMERS_TO_CONSIDER;
+DROP TABLE IF EXISTS #cancellation_customers;
+DROP TABLE IF EXISTS #INC_CUSTOMER;
+DROP TABLE IF EXISTS #cancellation_customers_not_jforce;
+DROP TABLE IF EXISTS #cancellation_customers_jforce;
+DROP TABLE IF EXISTS #TMP_CPS_OVERRIDE;
+DROP TABLE IF EXISTS #TMP_LAST_WHITELIST;
+
+END
