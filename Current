@@ -41,7 +41,6 @@ DROP TABLE IF EXISTS #blacklisted_phonenumber_customeraccounts;
 DROP TABLE IF EXISTS #final_insert;  
 DROP TABLE IF EXISTS #global_customers;  
 --DROP TABLE IF EXISTS #rma_abuse;  
-DROP TABLE IF EXISTS #BLACK_LISTED_CUSTOMERS;
 DROP TABLE IF EXISTS #TBT_JPAY_CUSTOMERS_TO_CONSIDER;
 DROP TABLE IF EXISTS #cancellation_customers;
 DROP TABLE IF EXISTS #INC_CUSTOMER;
@@ -52,15 +51,30 @@ DROP TABLE IF EXISTS #TMP_LAST_WHITELIST;
 DROP TABLE IF EXISTS #sk_customer_email_blacklisted;
 DROP TABLE IF EXISTS #customer_email_original_blacklisted;
 DROP TABLE IF EXISTS #blacklisted_email_customeraccounts;
+DROP TABLE IF EXISTS #TP;
 
- 
-DECLARE @Success_Rate_threshhold FLOAT
-DECLARE @Success_Rate_threshhold2 FLOAT
-DECLARE @Nr_shipped_orders_threshhold INT
-DECLARE @Nr_shipped_orders_threshhold2 INT
+-- get varibales from CDR Tool
+SELECT *
+INTO #TP
+FROM
+(SELECT 
+	PKPI.COD_CODE AS P_COD_CODE,
+	SKPI.MTR_THRESHOLD AS MTR_THRESHOLD,
+    SKPI.DAT_START_DATE,
+    LEAD(DATEADD(DAY, -1, SKPI.DAT_START_DATE), 1, '99991231') OVER(PARTITION BY PKPI.COD_CODE ORDER BY SKPI.DAT_START_DATE) DAT_END_DATE
+	FROM AIG_JUMIA_EG_STG.DBO.PRE_TOOLS_SINGLE_KPI AS SKPI
+    JOIN AIG_JUMIA_EG_STG.DBO.PRE_TOOLS_KPI AS PKPI ON PKPI.ID = SKPI.COD_KPI_PARENT
+                                                        AND PKPI.FLG_IS_DELETED = 0
+    WHERE PKPI.COD_TYPE = 'SINGLE'
+        -- NOT DELETED
+        AND SKPI.FLG_IS_DELETED = 0
+        -- GROUP
+        AND PKPI.COD_GROUP = 'CPS') TOOLS_PARAMETERS
+WHERE DATEADD(DAY, -1, GETDATE()) BETWEEN TOOLS_PARAMETERS.DAT_START_DATE AND TOOLS_PARAMETERS.DAT_END_DATE
+
 DECLARE @Country VARCHAR(2) = dbo.F_get_country_code()
-DECLARE @last3m_Success_Rate_threshhold FLOAT
-DECLARE @last3m_Nr_shipped_orders_threshhold INT
+DECLARE @last3m_Success_Rate_threshhold FLOAT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@last3m_Success_Rate_threshold')
+DECLARE @last3m_Nr_shipped_orders_threshhold INT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@last3m_Nr_shipped_orders_threshold')
 DECLARE @Last3m_start INT
 DECLARE @Last3m_end INT
  
@@ -70,36 +84,7 @@ DECLARE @LAST_3M_WHITELIST_START AS INT = CASE WHEN @Country = 'GH' THEN convert
 DECLARE @WHITELIST_SUCCESS_RATE AS FLOAT = CASE WHEN @Country = 'GH' THEN 0.31 --PTBI-3503
 											WHEN @Country = 'UG' THEN 0.20
 											ELSE 0.6 END
- 
-SET @Success_Rate_threshhold = CASE WHEN @Country in ('CI') THEN 0.66
-									WHEN @Country in ('DZ') THEN 0.50
-									WHEN @Country in ('EG') THEN 0.66
-									WHEN @Country in ('GH') THEN 0.66 -- Change to 30% PTBI-3503
-									WHEN @Country in ('KE') THEN 0.66
-									WHEN @Country in ('MA') THEN 0.66
-									WHEN @Country in ('NG') THEN 0.66
-									WHEN @Country in ('SN') THEN 0.50
-									WHEN @Country in ('TN') THEN 0.50
-									When @Country in ('UG') THEN 0.50
-								ELSE 0.60 END;
 
-SET @Success_Rate_threshhold2 = CASE WHEN @Country in ('DZ') THEN 0.2 -- PTBI-8230 - New logic for DZ
-								END;
-
-/* For @Nr_shipped_orders_threshhold if Orders >= X (when for example X = 3) then the value of @Nr_shipped_orders_threshhold should be X-1 (which for the example is 2)*/
-SET @Nr_shipped_orders_threshhold = CASE WHEN @Country in ('DZ') THEN 9 -- PTBI-8230 Orders >= 10 
-										WHEN @Country in ('EG') THEN 2
-										WHEN @Country in ('GH') THEN 2 --PTBI-4898 Orders >= 3
-										WHEN @Country in ('KE') THEN 2
-										WHEN @Country in ('MA') THEN 2
-										WHEN @Country in ('NG') THEN 3
-										WHEN @Country in ('SN') THEN 2 --PTBI-4898 Orders >= 3
-										WHEN @Country in ('TN') THEN 3  --PTBI-4898 Orders >= 4
-										When @Country in ('UG') THEN 2 --PTBI-4898 Orders >= 3
-									ELSE 3 END;
-
-SET @Nr_shipped_orders_threshhold2 = CASE	WHEN @Country in ('DZ') THEN 4 -- PTBI-8230 Orders >= 5
-											END;
 									
 DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_1_order FLOAT = .9;
 DECLARE @GlobalPostpayment_Success_Rate_threshhold_3_orders FLOAT = .8;
@@ -108,27 +93,16 @@ DECLARE @GlobalPostpayment_Success_Rate_threshhold_3_orders FLOAT = .8;
 DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_50_order FLOAT = .99;	--PTBI-3873 Especially for Emerging countires until we create a table to maintain variables
 DECLARE @GlobalPostpayment_Success_Rate_threshhold_global_customers_100_order FLOAT = .98;	--PTBI-3873 Especially for Emerging countires until we create a table to maintain variables
 
-DECLARE @CPS_CANCELLATION_RATE FLOAT        = (SELECT CONVERT(FLOAT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_RATE');
-DECLARE @CPS_CANCELLATION_ITEMS  INT        = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ITEMS');
-DECLARE @CPS_CANCELLATION_ORDERS        INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ORDERS');
-DECLARE @CPS_CANCELLATION_RATE_JFORCE FLOAT = (SELECT CONVERT(FLOAT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_RATE_JFORCE');
-DECLARE @CPS_CANCELLATION_ORDERS_JFORCE INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ORDERS_JFORCE');
-DECLARE @CPS_CANCELLATION_ITEMS_JFORCE  INT = (SELECT CONVERT(INT,PARAM_VALUE) FROM [$(JUMIA_BI_CONFIG)].dbo.CFG_PARAMETERS WHERE PARAM_KEY = 'CPS_CANCELLATION_ITEMS_JFORCE');
+DECLARE @CPS_CANCELLATION_RATE FLOAT        = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_RATE');
+DECLARE @CPS_CANCELLATION_ITEMS  INT        = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_ITEMS');
+DECLARE @CPS_CANCELLATION_ORDERS        INT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_ORDERS');
+DECLARE @CPS_CANCELLATION_RATE_JFORCE FLOAT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_RATE_JFORCE');
+DECLARE @CPS_CANCELLATION_ORDERS_JFORCE INT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_ORDERS_JFORCE');
+DECLARE @CPS_CANCELLATION_ITEMS_JFORCE  INT = (SELECT TP.MTR_THRESHOLD FROM #TP TP WHERE TP.P_COD_CODE = '@CPS_CANCELLATION_ITEMS_JFORCE');
 
  
 SET @Last3m_start = CONVERT(INT, CONVERT(VARCHAR(10), CAST(DATEADD(month, -3, getdate()) AS DATE), 112)) 
-SET @Last3m_end =  CONVERT(INT, (CONVERT(VARCHAR(10), CAST(GETDATE() AS DATE), 112))) 
-SET @last3m_Success_Rate_threshhold = CASE WHEN @Country in ('CI') THEN 0.50 -- PTBI-4894
-										WHEN @Country in ('DZ') THEN 0.50 -- PTBI-4898
-										WHEN @Country in ('GH') THEN 0.50 -- PTBI-4898
-										WHEN @Country in ('MA') THEN 0.55
-										WHEN @Country in ('SN') THEN 0.50 -- PTBI-4898
-										WHEN @Country in ('TN') THEN 0.50 -- PTBI-4898
-										When @Country in ('UG') THEN 0.50 -- PTBI-4898
-									ELSE 0.50 END;
-									
-SET @last3m_Nr_shipped_orders_threshhold = CASE	WHEN @Country in ('DZ') THEN 10 -- PTBI-8230 Orders > 10
-												ELSE 3 END;	
+SET @Last3m_end =  CONVERT(INT, (CONVERT(VARCHAR(10), CAST(GETDATE() AS DATE), 112)))
   
  
 --Changes required by PTBI-2815
@@ -169,12 +143,18 @@ SELECT SK_CUSTOMER,
    AND DD_DIMENSION = 'POSTPAYMENT' 
 GROUP BY SK_CUSTOMER;
 
- 
+/*****************************************  
+This query identifies customers to be blacklisted for PostPayment
+   - customers with more than @Nr_shipped_orders_threshhold shipped orders are considered. when less than half (OR @Success_Rate_threshhold) of items of their orders are delivered, they are blacklisted.
+   - when they get delivered successfully two orders after being blacklisted, they are taken off the blacklist  
+*****************************************/ 
+
 CREATE TABLE #last3m_blacklist_customers (SK_CUSTOMER BIGINT)
   
 INSERT INTO #last3m_blacklist_customers
 SELECT 
-	sk_customer
+	sk_customer,
+    ISNULL(ISNULL(TRY_CONVERT(FLOAT, nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, nr_shipped_items), 0), 0), 0) AS L3M_succ_rate
 FROM (
 SELECT s.sk_customer AS sk_customer,
 		COUNT(DISTINCT (CASE WHEN dsc_bi_status = 'delivered_final' THEN s.sk_sales_order
@@ -291,21 +271,8 @@ GROUP BY s.SK_CUSTOMER
 ) A
 WHERE nr_shipped_orders > @last3m_Nr_shipped_orders_threshhold AND 
 ISNULL(ISNULL(TRY_CONVERT(FLOAT, nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, nr_shipped_items), 0), 0), 0) < @last3m_Success_Rate_threshhold 
- 
- 
-/* FLG_RMA_abuse - customers will be blacklisted if they had abused RMA. and then they will not be eligible for whitelisting */
---CREATE TABLE #rma_abuse (sk_customer BIGINT, didnt_return_in_time BIT)
--- PTBI-5485: DEPRECATION OF RMA_ABUSE (WE'LL KEEP IT THIS WAYS BECAUSE IT WILL RETURN WITH A DIFFERENT FORMAT)
---insert into #rma_abuse
---select sk_customer, didnt_return_in_time from v_rma_classification_for_cps where classification='OFF'
- 
- 
-/*****************************************  
-This query identifies customers to be blacklisted for PostPayment
-   - customers with more than @Nr_shipped_orders_threshhold shipped orders are considered. when less than half (OR @Success_Rate_threshhold) of items of their orders are delivered, they are blacklisted.
-   - when they get delivered successfully two orders after being blacklisted, they are taken off the blacklist  
-*****************************************/ 
- 
+
+
 /* currently blacklisted customers */ 
 CREATE TABLE #currently_blacklisted (sk_customer BIGINT)
 INSERT INTO #currently_blacklisted
@@ -320,10 +287,7 @@ INNER JOIN (
 					AND CPSI.SK_DATE=LAST_DATE.SK_DATE
 					AND CPSI.DD_DIMENSION=LAST_DATE.DD_DIMENSION
 WHERE MTR_VALUE='OFF'
---UNION 
---SELECT sk_customer FROM #rma_abuse
- 
-   
+
  
 /* Whitelist. check the last two orders of customer. if they get to status Delivered /Delivered Final, the customer can be taken of the Blacklist.   
 This will also effectively whitelist customers who return majority of items from their orders, as long as both items are delivered.   */ 
@@ -465,156 +429,6 @@ HAVING SUM (CASE
         END)=2 
 
 
--- get customers with bad behaviour 
-SELECT b.sk_customer 
-  INTO #BLACK_LISTED_CUSTOMERS
-  FROM
-	(
-
-		SELECT A.sk_customer, a.cod_cas, a.nr_delivered_final_orders, a.nr_delivered_items,
-				  ISNULL(ISNULL(TRY_CONVERT(FLOAT, a.nr_delivered_items), 0) * 1.0 / NULLIF(ISNULL(TRY_CONVERT(FLOAT, a.nr_shipped_items), 0), 0), 0) AS succ_rate,
-				  a.nr_shipped_orders
-		   FROM
-			 (
-	 
-	 
-			 SELECT dcs.sk_customer AS sk_customer,
-					 dcs.cod_cas,
-					 COUNT(DISTINCT (CASE
-										 WHEN BI_STS.dsc_bi_status = 'delivered_final' THEN s.sk_sales_order
-										 ELSE NULL
-									 END)) AS nr_delivered_final_orders,
-					 SUM(CASE
-							 WHEN S.sk_delivered_date <> -1 THEN 1
-							 ELSE 0
-						 END) AS nr_delivered_items,
-
-					 COUNT(DISTINCT 
-						CASE WHEN s.sk_shipped_date <> -1 
-								AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
-								AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
-									 ( r.DSC_REASON_NAME like 'CA02%'
-									OR r.DSC_REASON_NAME like 'CA03%'
-									OR r.DSC_REASON_NAME like 'CA04%'
-									OR r.DSC_REASON_NAME like 'CA06%'
-									OR r.DSC_REASON_NAME like 'CA09%'
-									OR r.DSC_REASON_NAME like 'CA11%'
-									OR r.DSC_REASON_NAME like 'CA12%'
-									OR r.DSC_REASON_NAME like 'CA14%'
-									OR r.DSC_REASON_NAME like 'CA15%'
-									OR r.DSC_REASON_NAME like 'CA16%'
-									OR r.DSC_REASON_NAME like 'CA18%'
-									OR r.DSC_REASON_NAME like 'CA43%'
-									OR r.DSC_REASON_NAME like 'CA47%'
-									OR r.DSC_REASON_NAME like 'CA54%'
-									OR r.DSC_REASON_NAME like 'CA55%'
-									OR r.DSC_REASON_NAME like 'CA57%'
-									OR r.DSC_REASON_NAME like 'CA58%'
-									OR r.DSC_REASON_NAME like 'CA59%'
-									OR r.DSC_REASON_NAME like 'CA64%'
-									OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
-																,'Customer not able to pay on delivery'
-																,'Recipient reachable but not available'
-																,'Customer is a suspect of fraud/abuse'
-																,'Recipient provided invalid address/phone number'
-																,'This is a duplicate order'
-																,'Recipient needs consolidated delivery'
-																,'Shipping Fee is High'
-																,'Found a better offer outside Jumia'
-																,'Found a better offer in Jumia'
-																,'Not interested in order anymore'
-																,'Recipient requested delivery out of SLA or did not collect within SLA'
-																,'Change delivery address/method'
-																,'Recipient wanted to open package'
-																,'Could not provide OTP'
-																,'Customer is a suspect of fraud/abuse by JPay Risk Team'
-																,'I was testing Jumia'
-																,'Want to change voucher code'
-																)
-									  )
-									 )
-							THEN s.sk_sales_order
-							ELSE NULL 
-							END 
-						) AS nr_shipped_orders,
-
-					 COUNT(DISTINCT 
-						CASE WHEN s.sk_shipped_date <> -1 
-								AND bi_sts.DSC_BI_STATUS NOT IN ('shipped', 'stock_out')             
-								AND (bi_sts.DSC_BI_STATUS != 'rejected' OR 
-									 ( r.DSC_REASON_NAME like 'CA02%'
-									OR r.DSC_REASON_NAME like 'CA03%'
-									OR r.DSC_REASON_NAME like 'CA04%'
-									OR r.DSC_REASON_NAME like 'CA06%'
-									OR r.DSC_REASON_NAME like 'CA09%'
-									OR r.DSC_REASON_NAME like 'CA11%'
-									OR r.DSC_REASON_NAME like 'CA12%'
-									OR r.DSC_REASON_NAME like 'CA14%'
-									OR r.DSC_REASON_NAME like 'CA15%'
-									OR r.DSC_REASON_NAME like 'CA16%'
-									OR r.DSC_REASON_NAME like 'CA18%'
-									OR r.DSC_REASON_NAME like 'CA43%'
-									OR r.DSC_REASON_NAME like 'CA47%'
-									OR r.DSC_REASON_NAME like 'CA54%'
-									OR r.DSC_REASON_NAME like 'CA55%'
-									OR r.DSC_REASON_NAME like 'CA57%'
-									OR r.DSC_REASON_NAME like 'CA58%'
-									OR r.DSC_REASON_NAME like 'CA59%'
-									OR r.DSC_REASON_NAME like 'CA64%'
-									OR r.DSC_REASON_NAME IN    ( 'Recipient not reachable'
-																,'Customer not able to pay on delivery'
-																,'Recipient reachable but not available'
-																,'Customer is a suspect of fraud/abuse'
-																,'Recipient provided invalid address/phone number'
-																,'This is a duplicate order'
-																,'Recipient needs consolidated delivery'
-																,'Shipping Fee is High'
-																,'Found a better offer outside Jumia'
-																,'Found a better offer in Jumia'
-																,'Not interested in order anymore'
-																,'Recipient requested delivery out of SLA or did not collect within SLA'
-																,'Change delivery address/method'
-																,'Recipient wanted to open package'
-																,'Could not provide OTP'
-																,'Customer is a suspect of fraud/abuse by JPay Risk Team'
-																,'I was testing Jumia'
-																,'Want to change voucher code'
-																)
-									  )
-									 )
-							THEN s.sk_sales_order_item
-							ELSE NULL 
-							END 
-						) AS nr_shipped_items
- 
-			  FROM [dbo].[FCT_SALES_ORDER_ITEM_MARKETING] s WITH (NOLOCK)
-			  LEFT JOIN dim_customer dcs ON s.[SK_CUSTOMER] = dcs.[SK_CUSTOMER]
-			  INNER JOIN dim_bi_status bi_sts ON s.sk_bi_status = bi_sts.sk_bi_status AND dcs.cod_system = 'BOB'
-			  LEFT JOIN DIM_REASON r ON r.SK_REASON = s.SK_REASON
-			  LEFT JOIN #TMP_LAST_WHITELIST TWL ON TWL.SK_CUSTOMER = dcs.sk_customer
-			  LEFT JOIN #TMP_CPS_OVERRIDE TMP ON TMP.SK_CUSTOMER = s.SK_CUSTOMER AND TMP.DIMENSION = 'POSTPAYMENT' AND TMP.MTR_VALUE = 'ON'
-			  WHERE s.sk_date > CASE WHEN TMP.SK_DATE IS NULL OR isnull(TWL.LAST_WL_DATE,19000101) > TMP.SK_DATE THEN isnull(TWL.LAST_WL_DATE,19000101) ELSE TMP.SK_DATE END	-- To consider the max date between the overrided whitelist customer and the last whitelist from fct_cps_indicators.
-			  GROUP BY dcs.sk_customer, dcs.cod_cas
-	) a
-) b
-LEFT JOIN #whitelist wl ON b.SK_CUSTOMER = wl.SK_CUSTOMER
-LEFT JOIN #last3m_blacklist_customers last3m on b.sk_customer = last3m.sk_customer
---FULL JOIN #rma_abuse rmaab on b.sk_customer = rmaab.sk_customer   
-WHERE cod_cas IS NOT NULL
-AND b.sk_customer IN
-  (
-	  SELECT DISTINCT sk_customer FROM FCT_SALES_ORDER_ITEM_MARKETING WITH (NOLOCK)
-   --UNION 
-	  --SELECT sk_customer FROM #rma_abuse
-   )
--- FILTER HERE
-AND CASE WHEN B.succ_rate < @Success_Rate_threshhold AND B.nr_shipped_orders > @Nr_shipped_orders_threshhold AND wl.SK_CUSTOMER IS NULL THEN 1 
-		 WHEN B.succ_rate < @Success_Rate_threshhold2 AND B.nr_shipped_orders > @Nr_shipped_orders_threshhold2 AND wl.SK_CUSTOMER IS NULL AND @Country IN ('DZ') THEN 1 -- PTBI-8230
-		 WHEN last3m.sk_customer is not null AND wl.SK_CUSTOMER IS NULL THEN 1 
-		 --WHEN rmaab.sk_customer is not null THEN 1	
-		 ELSE 0 END = 1
-
-
 			/* phone numbers of blacklisted customers */
 			CREATE TABLE #currently_blacklisted_phonenumbers (DSC_SALES_ORDER_PHONE nvarchar(100) /*,SK_CUSTOMER BIGINT */)
 			INSERT INTO #currently_blacklisted_phonenumbers
@@ -622,7 +436,7 @@ AND CASE WHEN B.succ_rate < @Success_Rate_threshhold AND B.nr_shipped_orders > @
 			FROM  V_M02_F01_FCT_SALES_ORDER_ITEM_MARKETING mktg WITH (NOLOCK) 
 			inner join DIM_SALES_ORDER so on mktg.SK_SALES_ORDER = so.SK_SALES_ORDER
 			INNER JOIN #currently_blacklisted cb on cb.sk_customer = mktg.SK_CUSTOMER
-			INNER JOIN #BLACK_LISTED_CUSTOMERS BLC ON BLC.SK_CUSTOMER = MKTG.SK_CUSTOMER -- ONLY BAD CUSTOMERS
+			INNER JOIN #last3m_blacklist_customers BLC ON BLC.SK_CUSTOMER = MKTG.SK_CUSTOMER -- ONLY BAD CUSTOMERS
 			LEFT JOIN #whitelist wl on cb.sk_customer = wl.sk_customer
 			WHERE mktg.SK_SHIPPED_DATE > 19000101 /*only consider shipped orders*/
 				AND mktg.sk_date>=(select cast(convert(varchar(8),dateadd(year,-1,getdate()),112) as int))
@@ -1045,7 +859,7 @@ SELECT
 				AS GLOBAL_POSTPAYMENT_PRIVILEGE			-- currently only activated for NG,EG,KE
 				    
 		,NULL AS FLG_RMA_abuse 		/*abuse of RMA*/
-		,succ_rate AS MTR_SUCCESS_RATE
+		,last3m.L3M_succ_rate AS MTR_SUCCESS_RATE
 		,canc.QTD_CANCELLATION_ORDER AS MTR_CANCELLATION_ORDER
 		,canc.QTD_CANCELLATION_ITEM AS MTR_CANCELLATION_ITEM
 		,canc.MTR_CANCELLATION_RATE AS MTR_CANCELLATION_RATE
@@ -1477,8 +1291,6 @@ DROP TABLE IF EXISTS #blacklisted_phonenumber_customeraccounts;
 DROP TABLE IF EXISTS #blacklisted_email_customeraccounts;  
 DROP TABLE IF EXISTS #final_insert;  
 DROP TABLE IF EXISTS #global_customers;  
---DROP TABLE IF EXISTS #rma_abuse;  
-DROP TABLE IF EXISTS #BLACK_LISTED_CUSTOMERS;
 DROP TABLE IF EXISTS #TBT_JPAY_CUSTOMERS_TO_CONSIDER;
 DROP TABLE IF EXISTS #cancellation_customers;
 DROP TABLE IF EXISTS #INC_CUSTOMER;
